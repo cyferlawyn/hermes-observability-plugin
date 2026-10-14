@@ -1,1 +1,27 @@
 # hermes-observability-plugin
+
+A native Hermes Desktop observability plugin. The consolidated specification is in [`docs/ISA.md`](docs/ISA.md); the Control room reference is [`docs/prototype/session-overview.html`](docs/prototype/session-overview.html).
+
+## MVP scope
+
+This first implementation slice is deliberately narrower than the ISA first release. It proves the end-to-end capture and inspection path without widening the approved boundary:
+
+- Capture is prospective and local to the connected profile. Only sessions observed starting after the plugin is enabled are eligible; already-open sessions are skipped.
+- The native Desktop Control room lists profile sessions, labels uncaptured/partial/observed coverage, shows Overall tool-call counts and success rate, and drills into tool/MCP observer events.
+- Store versioned, plugin-owned metadata tables in the connected profile's existing `state.db`. Source-session deletion cascades to the plugin rows.
+- Persist only observer identity/correlation fields, timestamps, tool name, explicit outcome, duration, and structured error details. Do not copy tool arguments/results, provider request/response payloads, reasoning, or child transcripts.
+- Unknown and not-executed outcomes remain visible and are excluded from the success-rate denominator. Rates use only schema-compatible, gap-free sessions and report coverage exclusions; observed counts from incomplete populations are lower-bound evidence.
+
+Not in this MVP slice: Today/Since Reset windows and Reset Metrics, provider retry records, approval/subagent event families, cross-session repeated-error findings, and the user-triggered Analyze flow. These remain bounded by the ISA and are later implementation slices, not rejected features. Export, cross-install aggregation, automatic analysis, and unattended remediation remain out of scope as specified by the ISA.
+
+“Observed — no known gaps” is not a completeness guarantee: Hermes observer hooks fail open. This plugin is explicitly enabled through Hermes' plugin trust gates; once enabled, collection starts prospectively by default. No performance target is claimed before benchmarking.
+
+## Development
+
+Run the storage and collector tests with:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+The package layout follows Hermes' unified-plugin convention: `plugin.yaml` and `__init__.py` for the observer hooks, `dashboard/` for the profile-routed backend, and `desktop/plugin.js` for the local UI.
