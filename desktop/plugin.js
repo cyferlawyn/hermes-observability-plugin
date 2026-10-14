@@ -18,6 +18,21 @@ const EMPTY_METRICS = {
   rate_excluded_sessions: 0
 }
 
+const EMPTY_PROVIDER_ATTEMPTS = {
+  attempts: { total: 0, ok: 0, failed: 0, unknown: 0 },
+  unpaired_events: 0,
+  retryable_failures: 0,
+  success_rate: null,
+  supported_sessions: 0,
+  observed_sessions: 0,
+  partial_sessions: 0,
+  unknown_sessions: 0,
+  unsupported_sessions: 0,
+  not_captured_sessions: 0,
+  rate_excluded_sessions: 0,
+  rate_attempts: { ok: 0, failed: 0, denominator: 0 }
+}
+
 const rootStyle = {
   display: 'flex', flexDirection: 'column', gap: 12, padding: 16,
   height: '100%', minHeight: 0, overflow: 'auto', color: 'var(--ui-text-primary)',
@@ -53,6 +68,23 @@ function outcomeLabel(outcome) {
   return ({
     ok: 'Success', failed: 'Failed', not_executed: 'Not executed', unknown: 'Unknown'
   })[outcome] || 'Unknown'
+}
+
+function providerCoverageLabel(coverage) {
+  const support = coverage?.support_state || 'unknown'
+  const state = coverage?.coverage_state || 'unknown'
+  const supportText = ({ supported: 'supported', unsupported: 'unsupported', unknown: 'support unknown' })[support]
+  const stateText = ({
+    observed_no_known_gaps: 'Observed — no known gaps',
+    partial: 'Partial',
+    unknown: 'Unknown',
+    not_captured: 'Not captured'
+  })[state] || 'Unknown'
+  return `${supportText} · ${stateText}`
+}
+
+function providerOutcomeLabel(outcome) {
+  return ({ ok: 'Response received', failed: 'Request failed', unknown: 'Outcome unknown' })[outcome] || 'Outcome unknown'
 }
 
 function matchBasisLabel(basis) {
@@ -163,6 +195,12 @@ function ControlRoom({ rest }) {
 
   const sessions = Array.isArray(overview?.sessions) ? overview.sessions : []
   const metrics = overview?.metrics || EMPTY_METRICS
+  const providerMetrics = overview?.provider_attempts || EMPTY_PROVIDER_ATTEMPTS
+  const providerCounts = providerMetrics.attempts || EMPTY_PROVIDER_ATTEMPTS.attempts
+  const providerRate = providerMetrics.success_rate === null || providerMetrics.success_rate === undefined
+    ? '—' : `${(providerMetrics.success_rate * 100).toFixed(1)}%`
+  const providerEvents = Array.isArray(trace?.provider_attempts) ? trace.provider_attempts : []
+  const providerCoverage = trace?.provider_coverage
   const calls = metrics.calls || EMPTY_METRICS.calls
   const rateCalls = metrics.rate_calls || EMPTY_METRICS.rate_calls
   const rate = metrics.success_rate === null || metrics.success_rate === undefined
@@ -237,6 +275,24 @@ function ControlRoom({ rest }) {
         style: cardStyle,
         children: [
           jsxs('div', { children: [
+            jsx('h2', { style: { fontSize: 13, margin: '0 0 3px' }, children: 'Provider API attempts' }),
+            jsx('div', { style: mutedStyle, children: 'Main-loop provider requests exposed by observer hooks; request attempts and observer-reported retry metadata are separate from tool/MCP invocation counts. Unpaired callbacks are shown separately. Payloads and reasoning are never stored.' })
+          ] }),
+          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }, children: [
+            jsx(Metric, { label: 'API attempts', value: providerCounts.total, detail: `${providerCounts.ok} responses · ${providerCounts.failed} failed · ${providerCounts.unknown} unknown · ${providerMetrics.unpaired_events || 0} unpaired callbacks excluded` }),
+            jsx(Metric, { label: 'Retryable API failures', value: providerMetrics.retryable_failures || 0, detail: 'Observer-classified retryable failures; not a count of confirmed retries' }),
+            jsx(Metric, { label: 'API success rate', value: providerRate, detail: `${(providerMetrics.rate_attempts || EMPTY_PROVIDER_ATTEMPTS.rate_attempts).denominator} explicit outcomes · ${providerMetrics.observed_sessions || 0} compatible / ${providerMetrics.rate_excluded_sessions || 0} excluded sessions` }),
+            jsx(Metric, { label: 'Provider-family coverage', value: `${providerMetrics.supported_sessions || 0} supported`, detail: `${providerMetrics.observed_sessions || 0} observed · ${providerMetrics.partial_sessions || 0} partial · ${providerMetrics.unknown_sessions || 0} unknown · ${providerMetrics.unsupported_sessions || 0} unsupported · ${providerMetrics.not_captured_sessions || 0} not captured` })
+          ] }),
+          jsx('div', { style: { ...mutedStyle, marginTop: 5 }, children: providerCounts.total === 0 && providerMetrics.supported_sessions === 0
+            ? 'No compatible provider API observer coverage is available in this window; zero attempts cannot be inferred.'
+            : `Coverage is provider-family and schema-specific. Eligible sessions with no known lifecycle gaps may contribute a true zero; partial, unknown, and uncaptured sessions are excluded from the API success rate. Schema: ${overview?.observer_schema_version || 'unknown'}.` })
+        ]
+      }),
+      jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsxs('div', { children: [
             jsx('h2', { style: { fontSize: 13, margin: '0 0 3px' }, children: 'Repeated failures' }),
             jsx('div', { style: mutedStyle, children: 'Exact tool identity; structured error code/type preferred, otherwise exact message with UUID/ISO-timestamp masking only. No fuzzy grouping or generated remediation.' })
           ] }),
@@ -261,7 +317,7 @@ function ControlRoom({ rest }) {
                 jsxs('div', { style: { marginTop: 4, overflowWrap: 'anywhere' }, children: [
                   jsx('strong', { children: `${matchBasisLabel(finding.match_basis)}: ` }), finding.signature
                 ] }),
-                jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: `First ${displayTime(finding.first_observed_at)} · Last ${displayTime(finding.last_observed_at)} · ${finding.timeout_count} observed timeouts · Provider retries: not captured` }),
+                jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: `First ${displayTime(finding.first_observed_at)} · Last ${displayTime(finding.last_observed_at)} · ${finding.timeout_count} observed timeouts · provider API attempts are tracked separately` }),
                 jsx('div', { style: { marginTop: 4, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: finding.error_excerpt }),
                 jsxs('div', { style: { marginTop: 6 }, children: [
                   jsx('strong', { children: 'Example calls' }),
@@ -356,6 +412,42 @@ function ControlRoom({ rest }) {
               ]
             }, event.id))
           ] })
+        ]
+      }),
+      jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8 }, children: [
+            jsx('h2', { style: { fontSize: 13, margin: 0 }, children: 'Provider API trace' }),
+            jsx('span', { style: mutedStyle, children: providerCoverageLabel(providerCoverage) })
+          ] }),
+          jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: providerCoverage?.observer_schema_version
+            ? `Observer schema ${providerCoverage.observer_schema_version} · ${providerCoverage.attempt_count} attempts · ${providerCoverage.unpaired_event_count || 0} unpaired callbacks excluded from attempt count. No request/response payload or reasoning content is retained.`
+            : 'Provider-family support or coverage is unknown for this session.' }),
+          providerEvents.length === 0
+            ? jsx('div', { style: { ...mutedStyle, marginTop: 8 }, children: providerCoverage?.coverage_state === 'observed_no_known_gaps'
+              ? 'No provider API attempts observed in this session.'
+              : 'No provider attempts captured; absence cannot be inferred from this coverage state.' })
+            : providerEvents.map(event => jsxs('article', {
+              style: { borderTop: '1px solid var(--ui-stroke-secondary)', padding: '8px 0', marginTop: 7 },
+              children: [
+                jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8 }, children: [
+                  jsx('strong', { children: `${event.capture_state === 'post_only' ? 'Unpaired outcome · ' : ''}${event.provider || 'Provider unknown'} · ${event.model || 'Model unknown'}` }),
+                  jsx('span', { style: mutedStyle, children: providerOutcomeLabel(event.outcome) })
+                ] }),
+                jsx('div', { style: { ...mutedStyle, marginTop: 2, overflowWrap: 'anywhere' }, children: `API call ${event.api_call_count ?? 'unknown'} · request ${event.api_request_id || 'ID unavailable'} · ${displayTime(event.started_at || event.ended_at)}${event.api_duration == null ? '' : ` · ${Number(event.api_duration).toFixed(2)} s`}` }),
+                event.status_code != null || event.error_type || event.retry_count != null || event.retryable != null
+                  ? jsx('div', { style: { marginTop: 4 }, children: `${event.error_type || 'API outcome'}${event.status_code == null ? '' : ` · HTTP ${event.status_code}`}${event.retry_count == null ? '' : ` · observer retry counter ${event.retry_count}`}${event.retryable == null ? '' : ` · retryable ${event.retryable ? 'yes' : 'no'}`}` }) : null,
+                event.finish_reason || event.response_model
+                  ? jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: [event.response_model ? `Response model ${event.response_model}` : '', event.finish_reason ? `Finish reason ${event.finish_reason}` : ''].filter(Boolean).join(' · ') }) : null,
+                Object.keys(event.usage || {}).length
+                  ? jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: `Usage: ${Object.entries(event.usage).map(([key, value]) => `${key} ${value}`).join(' · ')}` }) : null,
+                event.capture_state !== 'paired'
+                  ? jsx('div', { style: { ...mutedStyle, marginTop: 4 }, children: event.capture_state === 'post_only'
+                    ? 'Unpaired API callback; excluded from attempt totals because no safe lifecycle match was available.'
+                    : 'API attempt has no observed completion; provider coverage is partial.' }) : null
+              ]
+            }, event.id))
         ]
       })
     ]
