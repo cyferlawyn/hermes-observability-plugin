@@ -2,6 +2,10 @@
 
 A native Hermes Desktop observability plugin. The consolidated specification is in [`docs/ISA.md`](docs/ISA.md); the Control room reference is [`docs/prototype/session-overview.html`](docs/prototype/session-overview.html).
 
+## Control room
+
+![Hermes Desktop Observability Control room showing captured tool calls, success rate, and coverage.](docs/assets/observability-control-room.png)
+
 ## MVP scope
 
 This first implementation slice is deliberately narrower than the ISA first release. It proves the end-to-end capture and inspection path without widening the approved boundary:
@@ -15,6 +19,34 @@ This first implementation slice is deliberately narrower than the ISA first rele
 Not in this MVP slice: Today/Since Reset windows and Reset Metrics, provider retry records, approval/subagent event families, cross-session repeated-error findings, and the user-triggered Analyze flow. These remain bounded by the ISA and are later implementation slices, not rejected features. Export, cross-install aggregation, automatic analysis, and unattended remediation remain out of scope as specified by the ISA.
 
 “Observed — no known gaps” is not a completeness guarantee: Hermes observer hooks fail open. This plugin is explicitly enabled through Hermes' plugin trust gates; once enabled, collection starts prospectively by default. No performance target is claimed before benchmarking.
+
+## Installation
+
+The plugin has two parts: an agent/backend half that runs with the gateway profile, and a Desktop UI half that runs in the Hermes Desktop app. When Desktop connects to a remote gateway, install the halves on their respective machines.
+
+### Install and enable the gateway half
+
+Run this on the gateway host, using the Hermes profile whose sessions you want to observe:
+
+```sh
+hermes plugins install --enable https://github.com/cyferlawyn/hermes-observability-plugin.git
+```
+
+The `--enable` flag enables the agent/backend half in that profile. Verify its status with:
+
+```sh
+hermes plugins list --plain --no-bundled
+```
+
+### Install and enable the Desktop UI
+
+In Hermes Desktop on the client machine, open **Settings → Capabilities → Plugins → Install from Git** and enter the same repository URL. For a remote gateway where the agent half is already installed, choose **Desktop only** (leave the agent/backend half unchecked). After installation, enable the **Observability** Desktop plugin. It adds an **Observability** item to the sidebar.
+
+If both the gateway and Desktop app use the same local Hermes home, the installer can install both halves together instead.
+
+### Verify capture
+
+Start a new Hermes session after enabling the gateway half, then make a tool/MCP call. The Control room should list that session and its observed call. Capture is prospective: sessions that were already open or started before enablement are not backfilled. Only operational metadata is stored; tool arguments and results are not captured.
 
 ## Development
 
