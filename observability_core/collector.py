@@ -20,6 +20,8 @@ class Collector:
         self._eligible: set[str] = set()
         self._pending: dict[tuple[str, ...], deque[str]] = defaultdict(deque)
         self._ambiguous_pending_keys: set[tuple[str, ...]] = set()
+        self._provider_pending: dict[tuple[str, ...], str] = {}
+        self._ambiguous_provider_pending_keys: set[tuple[str, ...]] = set()
         self._lock = threading.RLock()
 
     def _connection(self):
@@ -34,10 +36,9 @@ class Collector:
         try:
             with self._connection() as conn:
                 if conn is not None:
-                    store.register_session(
-                        conn, session_id,
-                        observer_schema_version=_observer_schema_version(kwargs),
-                    )
+                    version = _observer_schema_version(kwargs)
+                    store.register_session(conn, session_id, observer_schema_version=version)
+                    store.register_provider_family(conn, session_id, version)
         except Exception:
             log.warning("observability: failed to mark session start", exc_info=True)
 
@@ -49,10 +50,9 @@ class Collector:
         try:
             with self._connection() as conn:
                 if conn is not None:
-                    store.register_session(
-                        conn, session_id,
-                        observer_schema_version=_observer_schema_version(kwargs),
-                    )
+                    version = _observer_schema_version(kwargs)
+                    store.register_session(conn, session_id, observer_schema_version=version)
+                    store.register_provider_family(conn, session_id, version)
         except Exception:
             log.warning("observability: failed to close session run", exc_info=True)
 
@@ -66,6 +66,13 @@ class Collector:
                 self._pending.pop(key, None)
             self._ambiguous_pending_keys = {
                 key for key in self._ambiguous_pending_keys if key[0] != session_id
+            }
+            self._provider_pending = {
+                key: event_id for key, event_id in self._provider_pending.items()
+                if key[0] != session_id
+            }
+            self._ambiguous_provider_pending_keys = {
+                key for key in self._ambiguous_provider_pending_keys if key[0] != session_id
             }
 
     def on_pre_tool_call(self, **kwargs: Any) -> None:
@@ -180,6 +187,81 @@ class Collector:
         except Exception:
             log.warning("observability: failed to record tool completion", exc_info=True)
 
+    def on_pre_api_request(self, **kwargs: Any) -> None:
+        """Capture the documented API-attempt metadata without retaining payloads."""
+        session_id = str(kwargs.get("session_id") or "")
+        if not session_id or not self._is_eligible(session_id):
+            return
+        version = _observer_schema_version(kwargs)
+        try:
+            with self._connection() as conn:
+                if conn is None or not store.register_session(
+                    conn, session_id, observer_schema_version=version
+                ):
+                    return
+                store.register_provider_family(conn, session_id, version)
+                event_id = store.begin_provider_attempt(
+                    conn,
+                    session_id,
+                    task_id=kwargs.get("task_id"),
+                    turn_id=kwargs.get("turn_id"),
+                    api_request_id=kwargs.get("api_request_id"),
+                    api_call_count=kwargs.get("api_call_count"),
+                    provider=kwargs.get("provider"),
+                    model=kwargs.get("model"),
+                    started_at=kwargs.get("started_at"),
+                    observer_schema_version=version,
+                )
+            key = _provider_attempt_match_key(kwargs)
+            if event_id and key:
+                with self._lock:
+                    if key in self._ambiguous_provider_pending_keys:
+                        return
+                    if key in self._provider_pending:
+                        self._provider_pending.pop(key, None)
+                        self._ambiguous_provider_pending_keys.add(key)
+                    else:
+                        self._provider_pending[key] = event_id
+        except Exception:
+            log.warning("observability: failed to record provider attempt start", exc_info=True)
+
+    def on_post_api_request(self, **kwargs: Any) -> None:
+        self._finish_provider_attempt(kwargs, outcome="ok")
+
+    def on_api_request_error(self, **kwargs: Any) -> None:
+        self._finish_provider_attempt(kwargs, outcome="failed")
+
+    def _finish_provider_attempt(self, kwargs: dict[str, Any], *, outcome: str) -> None:
+        session_id = str(kwargs.get("session_id") or "")
+        if not session_id or not self._is_eligible(session_id):
+            return
+        key = _provider_attempt_match_key(kwargs)
+        with self._lock:
+            if key and key not in self._ambiguous_provider_pending_keys:
+                event_id = self._provider_pending.pop(key, None)
+            else:
+                event_id = None
+        version = _observer_schema_version(kwargs)
+        try:
+            with self._connection() as conn:
+                if conn is None or not store.register_session(
+                    conn, session_id, observer_schema_version=version
+                ):
+                    return
+                store.register_provider_family(conn, session_id, version)
+                completed = bool(
+                    event_id and store.complete_provider_attempt(
+                        conn, event_id, kwargs, outcome=outcome
+                    )
+                )
+                if not completed:
+                    store.record_post_only_provider_attempt(
+                        conn, session_id, kwargs, outcome=outcome,
+                        observer_schema_version=version,
+                    )
+        except Exception:
+            log.warning("observability: failed to record provider attempt completion", exc_info=True)
+
     def _is_eligible(self, session_id: str) -> bool:
         with self._lock:
             return session_id in self._eligible
@@ -210,6 +292,19 @@ def _tool_call_match_key(
     )
 
 
+def _provider_attempt_match_key(kwargs: dict[str, Any]) -> tuple[str, ...] | None:
+    session_id = _optional_text(kwargs.get("session_id"))
+    request_id = _optional_text(kwargs.get("api_request_id"))
+    if not session_id or not request_id or not request_id.strip():
+        return None
+    return (
+        session_id,
+        _optional_text(kwargs.get("task_id")) or "",
+        _optional_text(kwargs.get("turn_id")) or "",
+        request_id,
+    )
+
+
 def _observer_schema_version(kwargs: dict[str, Any]) -> str:
     value = kwargs.get("telemetry_schema_version")
     return str(value) if value not in (None, "") else "unknown"
@@ -234,6 +329,9 @@ def register(ctx: Any, connection_factory: Callable[[], Any]) -> Collector:
         ("on_session_finalize", collector.on_session_finalize),
         ("pre_tool_call", collector.on_pre_tool_call),
         ("post_tool_call", collector.on_post_tool_call),
+        ("pre_api_request", collector.on_pre_api_request),
+        ("post_api_request", collector.on_post_api_request),
+        ("api_request_error", collector.on_api_request_error),
     ):
         ctx.register_hook(name, callback)
     return collector

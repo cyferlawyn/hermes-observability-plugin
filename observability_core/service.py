@@ -22,6 +22,9 @@ def overview(
         "observer_schema_version": store.OBSERVER_SCHEMA_VERSION,
         "telemetry_schema_version": store.SCHEMA_VERSION,
         "metrics": store.metrics(conn, window=window, now=now, timezone_name=timezone_name),
+        "provider_attempts": store.provider_metrics(
+            conn, window=window, now=now, timezone_name=timezone_name
+        ),
         "sessions": store.list_sessions(
             conn, limit=session_limit, window=window, now=now, timezone_name=timezone_name
         ),
@@ -49,6 +52,8 @@ def session_trace(
         "window": window,
         "session": session,
         "calls": store.session_trace(conn, session_id),
+        "provider_attempts": store.session_provider_attempts(conn, session_id),
+        "provider_coverage": store.provider_session_coverage(conn, session_id),
     }
 
 

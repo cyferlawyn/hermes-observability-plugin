@@ -5,6 +5,7 @@ arguments/results, provider request/response payloads, or reasoning fields.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import uuid
@@ -14,11 +15,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import repeated_failures
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 _META_TABLE = "hermes_observability_meta"
 _SESSIONS_TABLE = "hermes_observability_sessions"
 _CALLS_TABLE = "hermes_observability_calls"
+_PROVIDER_ATTEMPTS_TABLE = "hermes_observability_provider_attempts"
+_FAMILY_COVERAGE_TABLE = "hermes_observability_family_coverage"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {_META_TABLE} (
@@ -56,6 +59,42 @@ CREATE INDEX IF NOT EXISTS hermes_observability_calls_session_idx
     ON {_CALLS_TABLE}(session_id, started_at, id);
 CREATE INDEX IF NOT EXISTS hermes_observability_calls_tool_idx
     ON {_CALLS_TABLE}(session_id, tool_name, completed_at);
+CREATE TABLE IF NOT EXISTS {_FAMILY_COVERAGE_TABLE} (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    event_family TEXT NOT NULL,
+    observer_schema_version TEXT NOT NULL,
+    support_state TEXT NOT NULL CHECK (support_state IN ('supported', 'unsupported', 'unknown')),
+    PRIMARY KEY (session_id, event_family)
+);
+CREATE TABLE IF NOT EXISTS {_PROVIDER_ATTEMPTS_TABLE} (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    task_id TEXT,
+    turn_id TEXT,
+    api_request_id TEXT,
+    api_call_count INTEGER,
+    provider TEXT,
+    model TEXT,
+    started_at REAL,
+    ended_at REAL,
+    api_duration REAL,
+    outcome TEXT NOT NULL DEFAULT 'unknown' CHECK (outcome IN ('ok', 'failed', 'unknown')),
+    status_code INTEGER,
+    retry_count INTEGER,
+    max_retries INTEGER,
+    retryable INTEGER CHECK (retryable IN (0, 1) OR retryable IS NULL),
+    error_type TEXT,
+    response_model TEXT,
+    finish_reason TEXT,
+    usage TEXT NOT NULL DEFAULT '{{}}',
+    observer_schema_version TEXT NOT NULL,
+    capture_state TEXT NOT NULL DEFAULT 'start_only'
+        CHECK (capture_state IN ('paired', 'start_only', 'post_only'))
+);
+CREATE INDEX IF NOT EXISTS hermes_observability_provider_session_idx
+    ON {_PROVIDER_ATTEMPTS_TABLE}(session_id, started_at, id);
+CREATE INDEX IF NOT EXISTS hermes_observability_provider_turn_idx
+    ON {_PROVIDER_ATTEMPTS_TABLE}(session_id, turn_id, api_call_count);
 """
 
 
@@ -110,6 +149,344 @@ def register_session(
     )
     conn.commit()
     return True
+
+
+def register_provider_family(
+    conn: sqlite3.Connection, session_id: str, observer_schema_version: str
+) -> bool:
+    """Record API-family support independently from tool-call coverage."""
+    if conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone() is None:
+        return False
+    version = str(observer_schema_version or "unknown")
+    support = "supported" if version == OBSERVER_SCHEMA_VERSION else "unknown"
+    conn.execute(
+        f"INSERT INTO {_FAMILY_COVERAGE_TABLE} "
+        "(session_id, event_family, observer_schema_version, support_state) VALUES (?, 'provider_api', ?, ?) "
+        "ON CONFLICT(session_id, event_family) DO UPDATE SET "
+        "observer_schema_version = CASE WHEN observer_schema_version = excluded.observer_schema_version "
+        "THEN observer_schema_version ELSE 'unknown' END, "
+        "support_state = CASE WHEN observer_schema_version = excluded.observer_schema_version "
+        "THEN support_state ELSE 'unknown' END",
+        (session_id, version, support),
+    )
+    conn.commit()
+    return True
+
+
+def _safe_text(value: Any, limit: int = 256) -> str | None:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = str(value)
+    return text[:limit] if text else None
+
+
+def _identity_text(value: Any) -> str | None:
+    """Preserve opaque observer identifiers verbatim; never trim or truncate them."""
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _optional_int(value: Any, *, minimum: int = 0, maximum: int = 2**31 - 1) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if minimum <= number <= maximum else None
+
+
+def _usage_json(usage: Any) -> str:
+    """Keep only known numeric token counters; never serialize provider objects."""
+    allowed = {
+        "input_tokens", "output_tokens", "total_tokens", "prompt_tokens", "completion_tokens",
+        "cache_read_input_tokens", "cache_creation_input_tokens",
+    }
+    safe: dict[str, int] = {}
+    if isinstance(usage, dict):
+        for key in allowed:
+            value = _optional_int(usage.get(key))
+            if value is not None:
+                safe[key] = value
+    return json.dumps(safe, sort_keys=True, separators=(",", ":"))
+
+
+def begin_provider_attempt(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    task_id: Any = None,
+    turn_id: Any = None,
+    api_request_id: Any = None,
+    api_call_count: Any = None,
+    provider: Any = None,
+    model: Any = None,
+    started_at: Any = None,
+    observer_schema_version: str = OBSERVER_SCHEMA_VERSION,
+) -> str | None:
+    """Persist a metadata-only provider attempt; raw request payloads are never accepted."""
+    if conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone() is None:
+        return None
+    attempt_id = uuid.uuid4().hex
+    start = _optional_float(started_at)
+    if start is None:
+        start = time.time()
+    conn.execute(
+        f"INSERT INTO {_PROVIDER_ATTEMPTS_TABLE} "
+        "(id, session_id, task_id, turn_id, api_request_id, api_call_count, provider, model, "
+        "started_at, observer_schema_version, outcome, capture_state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 'start_only')",
+        (attempt_id, session_id, _identity_text(task_id), _identity_text(turn_id), _identity_text(api_request_id),
+         _optional_int(api_call_count, minimum=1), _safe_text(provider), _safe_text(model), start,
+         str(observer_schema_version or "unknown")),
+    )
+    conn.commit()
+    return attempt_id
+
+
+def _provider_update_values(event: dict[str, Any], outcome: str) -> tuple[Any, ...]:
+    ended = _optional_float(event.get("ended_at"))
+    if ended is None:
+        ended = time.time()
+    duration = _optional_float(event.get("api_duration"))
+    retryable = event.get("retryable")
+    if not isinstance(retryable, bool):
+        retryable = None
+    error = event.get("error")
+    if not isinstance(error, dict):
+        error = {}
+    return (
+        ended, duration, outcome,
+        _optional_int(event.get("status_code"), maximum=999),
+        _optional_int(event.get("retry_count")), _optional_int(event.get("max_retries")),
+        None if retryable is None else int(retryable), _safe_text(error.get("type")),
+        _safe_text(event.get("response_model")), _safe_text(event.get("finish_reason")),
+        _usage_json(event.get("usage")),
+    )
+
+
+def complete_provider_attempt(
+    conn: sqlite3.Connection, attempt_id: str, event: dict[str, Any], *, outcome: str
+) -> bool:
+    """Attach one success/error callback to its exact opaque API request ID."""
+    if outcome not in {"ok", "failed", "unknown"}:
+        outcome = "unknown"
+    cursor = conn.execute(
+        f"UPDATE {_PROVIDER_ATTEMPTS_TABLE} SET ended_at = ?, api_duration = ?, outcome = ?, "
+        "status_code = ?, retry_count = ?, max_retries = ?, retryable = ?, error_type = ?, "
+        "response_model = ?, finish_reason = ?, usage = ?, capture_state = 'paired' "
+        "WHERE id = ? AND ended_at IS NULL",
+        (*_provider_update_values(event, outcome), attempt_id),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def record_post_only_provider_attempt(
+    conn: sqlite3.Connection,
+    session_id: str,
+    event: dict[str, Any],
+    *,
+    outcome: str,
+    observer_schema_version: str = OBSERVER_SCHEMA_VERSION,
+) -> str | None:
+    """Keep an unpaired API outcome visible while making family coverage partial."""
+    if conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone() is None:
+        return None
+    if outcome not in {"ok", "failed", "unknown"}:
+        outcome = "unknown"
+    attempt_id = uuid.uuid4().hex
+    values = _provider_update_values(event, outcome)
+    conn.execute(
+        f"INSERT INTO {_PROVIDER_ATTEMPTS_TABLE} "
+        "(id, session_id, task_id, turn_id, api_request_id, api_call_count, provider, model, "
+        "ended_at, api_duration, outcome, status_code, retry_count, max_retries, retryable, error_type, "
+        "response_model, finish_reason, usage, observer_schema_version, capture_state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'post_only')",
+        (attempt_id, session_id, _identity_text(event.get("task_id")), _identity_text(event.get("turn_id")),
+         _identity_text(event.get("api_request_id")), _optional_int(event.get("api_call_count"), minimum=1),
+         _safe_text(event.get("provider")), _safe_text(event.get("model")), *values,
+         str(observer_schema_version or "unknown")),
+    )
+    conn.commit()
+    return attempt_id
+
+
+def session_provider_attempts(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    """Return safe provider attempt metadata for one source session."""
+    rows = conn.execute(
+        f"SELECT id, session_id, task_id, turn_id, api_request_id, api_call_count, provider, model, "
+        "started_at, ended_at, api_duration, outcome, status_code, retry_count, max_retries, retryable, "
+        "error_type, response_model, finish_reason, usage, observer_schema_version, capture_state "
+        f"FROM {_PROVIDER_ATTEMPTS_TABLE} WHERE session_id = ? "
+        "ORDER BY COALESCE(started_at, ended_at), id",
+        (session_id,),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["usage"] = json.loads(item["usage"])
+        except (TypeError, json.JSONDecodeError):
+            item["usage"] = {}
+        result.append(item)
+    return result
+
+
+def provider_session_coverage(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+    """Describe provider-family support and detected gaps for one eligible session."""
+    captured = conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    family = conn.execute(
+        f"SELECT observer_schema_version, support_state FROM {_FAMILY_COVERAGE_TABLE} "
+        "WHERE session_id = ? AND event_family = 'provider_api'",
+        (session_id,),
+    ).fetchone()
+    attempt_count = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_PROVIDER_ATTEMPTS_TABLE} WHERE session_id = ? "
+        "AND capture_state != 'post_only'", (session_id,)
+    ).fetchone()[0])
+    unpaired_event_count = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_PROVIDER_ATTEMPTS_TABLE} WHERE session_id = ? "
+        "AND capture_state = 'post_only'", (session_id,)
+    ).fetchone()[0])
+    if not captured:
+        return {
+            "support_state": "unknown", "coverage_state": "not_captured",
+            "observer_schema_version": None, "attempt_count": attempt_count,
+            "unpaired_event_count": unpaired_event_count,
+        }
+    if not family:
+        return {
+            "support_state": "unknown", "coverage_state": "unknown",
+            "observer_schema_version": None, "attempt_count": attempt_count,
+            "unpaired_event_count": unpaired_event_count,
+        }
+    version = str(family["observer_schema_version"])
+    support = str(family["support_state"])
+    if support != "supported" or version != OBSERVER_SCHEMA_VERSION:
+        coverage = "unknown"
+    else:
+        gap = conn.execute(
+            f"SELECT 1 FROM {_PROVIDER_ATTEMPTS_TABLE} WHERE session_id = ? "
+            "AND (capture_state != 'paired' OR outcome = 'unknown') LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        coverage = "partial" if gap else "observed_no_known_gaps"
+    return {
+        "support_state": support, "coverage_state": coverage,
+        "observer_schema_version": version, "attempt_count": attempt_count,
+        "unpaired_event_count": unpaired_event_count,
+    }
+
+
+def provider_metrics(
+    conn: sqlite3.Connection,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate API attempts separately with family-specific support and gap counts."""
+    current = float(now if now is not None else time.time())
+    predicate, params = _session_window(
+        window, current, _reset_cutoff(conn), timezone_name=timezone_name
+    )
+    counts = {"total": 0, "ok": 0, "failed": 0, "unknown": 0}
+    for row in conn.execute(
+        f"SELECT p.outcome, COUNT(*) AS n FROM {_PROVIDER_ATTEMPTS_TABLE} p "
+        f"JOIN sessions s ON s.id = p.session_id WHERE {predicate} "
+        "AND p.capture_state != 'post_only' GROUP BY p.outcome",
+        params,
+    ):
+        outcome = str(row["outcome"])
+        if outcome in counts:
+            counts[outcome] = int(row["n"])
+            counts["total"] += int(row["n"])
+    total_sessions = int(conn.execute(
+        f"SELECT COUNT(*) FROM sessions s WHERE {predicate}", params
+    ).fetchone()[0])
+    family_from = (
+        f"FROM {_FAMILY_COVERAGE_TABLE} f JOIN sessions s ON s.id = f.session_id "
+        f"WHERE {predicate} AND f.event_family = 'provider_api'"
+    )
+    eligible_sessions = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_SESSIONS_TABLE} o JOIN sessions s ON s.id = o.session_id "
+        f"WHERE {predicate}", params
+    ).fetchone()[0])
+    supported_filter = "AND f.support_state = 'supported' AND f.observer_schema_version = ?"
+    supported = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} {supported_filter}",
+        (*params, OBSERVER_SCHEMA_VERSION),
+    ).fetchone()[0])
+    unsupported = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} AND f.support_state = 'unsupported'",
+        params,
+    ).fetchone()[0])
+    unknown = max(0, eligible_sessions - supported - unsupported)
+    gap_predicate = (
+        f"NOT EXISTS (SELECT 1 FROM {_PROVIDER_ATTEMPTS_TABLE} p "
+        "WHERE p.session_id = f.session_id AND (p.capture_state != 'paired' OR p.outcome = 'unknown'))"
+    )
+    observed = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} {supported_filter} AND {gap_predicate}",
+        (*params, OBSERVER_SCHEMA_VERSION),
+    ).fetchone()[0])
+    partial = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} {supported_filter} AND NOT ({gap_predicate})",
+        (*params, OBSERVER_SCHEMA_VERSION),
+    ).fetchone()[0])
+    observed_attempts = {"ok": 0, "failed": 0, "denominator": 0}
+    for row in conn.execute(
+        f"SELECT p.outcome, COUNT(*) AS n FROM {_PROVIDER_ATTEMPTS_TABLE} p "
+        f"JOIN {_FAMILY_COVERAGE_TABLE} f ON f.session_id = p.session_id "
+        "JOIN sessions s ON s.id = p.session_id "
+        f"WHERE {predicate} AND f.event_family = 'provider_api' "
+        "AND f.support_state = 'supported' AND f.observer_schema_version = ? "
+        f"AND {gap_predicate} AND p.outcome IN ('ok', 'failed') GROUP BY p.outcome",
+        (*params, OBSERVER_SCHEMA_VERSION),
+    ):
+        observed_attempts[str(row["outcome"])] = int(row["n"])
+    observed_attempts["denominator"] = observed_attempts["ok"] + observed_attempts["failed"]
+    rate = observed_attempts["ok"] / observed_attempts["denominator"] if observed_attempts["denominator"] else None
+    unpaired_events = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_PROVIDER_ATTEMPTS_TABLE} p "
+        f"JOIN sessions s ON s.id = p.session_id WHERE {predicate} AND p.capture_state = 'post_only'",
+        params,
+    ).fetchone()[0])
+    retryable_failures = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_PROVIDER_ATTEMPTS_TABLE} p "
+        f"JOIN sessions s ON s.id = p.session_id WHERE {predicate} "
+        "AND p.capture_state != 'post_only' AND p.retryable = 1",
+        params,
+    ).fetchone()[0])
+    return {
+        "window": window, "attempts": counts, "unpaired_events": unpaired_events,
+        "retryable_failures": retryable_failures,
+        "success_rate": rate, "total_sessions": total_sessions,
+        "captured_sessions": eligible_sessions, "supported_sessions": supported,
+        "observed_sessions": observed, "partial_sessions": partial,
+        "unknown_sessions": unknown, "unsupported_sessions": unsupported,
+        "not_captured_sessions": max(0, total_sessions - eligible_sessions),
+        "rate_excluded_sessions": max(0, total_sessions - observed),
+        "rate_attempts": observed_attempts,
+    }
 
 
 def begin_tool_call(
