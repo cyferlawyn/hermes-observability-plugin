@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from . import store
+from . import source_detail, store
 
 
 def overview(conn: sqlite3.Connection, *, session_limit: int = 100) -> dict[str, Any]:
@@ -26,4 +26,23 @@ def session_trace(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] |
     return {
         "session": session,
         "calls": store.session_trace(conn, session_id),
+    }
+
+
+def call_detail(
+    conn: sqlite3.Connection, session_id: str, call_id: str
+) -> dict[str, Any] | None:
+    """Join one observer call to canonical source messages on exact identifiers."""
+    call = store.call_record(conn, session_id, call_id)
+    if call is None:
+        return None
+    source = source_detail.resolve_call(
+        conn, session_id, call["tool_name"], call["tool_call_id"]
+    )
+    context = source.pop("context", [])
+    return {
+        "available": source["status"] == "matched",
+        "call": call,
+        "source": source,
+        "context": context,
     }

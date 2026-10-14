@@ -12,7 +12,8 @@ This first implementation slice is deliberately narrower than the ISA first rele
 
 - Capture is prospective and local to the connected profile. Only sessions observed starting after the plugin is enabled are eligible; already-open sessions are skipped.
 - The native Desktop Control room lists profile sessions, labels uncaptured/partial/observed coverage, shows Overall tool-call counts and success rate, and drills into tool/MCP observer events.
-- Store versioned, plugin-owned metadata tables in the connected profile's existing `state.db`. Source-session deletion cascades to the plugin rows.
+- Call detail reads visible arguments/result and nearby visible conversation from canonical session messages on demand using exact session/tool-call IDs, alongside captured error metadata; it never copies source content into plugin telemetry, and missing or ambiguous matches remain unavailable.
+- Store versioned, plugin-owned metadata tables in the connected profile's existing `state.db`; source-session deletion cascades to plugin rows.
 - Persist only observer identity/correlation fields, timestamps, tool name, explicit outcome, duration, and structured error details. Do not copy tool arguments/results, provider request/response payloads, reasoning, or child transcripts.
 - Unknown and not-executed outcomes remain visible and are excluded from the success-rate denominator. Rates use only schema-compatible, gap-free sessions and report coverage exclusions; observed counts from incomplete populations are lower-bound evidence.
 

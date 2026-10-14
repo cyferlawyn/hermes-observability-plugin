@@ -240,6 +240,17 @@ def session_trace(conn: sqlite3.Connection, session_id: str) -> list[dict[str, A
     return [dict(row) for row in rows]
 
 
+def call_record(conn: sqlite3.Connection, session_id: str, call_id: str) -> dict[str, Any] | None:
+    """Return one captured call's metadata, scoped to its exact source session."""
+    row = conn.execute(
+        f"SELECT id, session_id, tool_name, tool_call_id, started_at, completed_at, "
+        f"duration_ms, outcome, error_type, error_message FROM {_CALLS_TABLE} "
+        "WHERE session_id = ? AND id = ?",
+        (session_id, call_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def list_sessions(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]]:
     """List session headers and explicit coverage labels, newest first."""
     limit = max(1, min(int(limit), 500))
