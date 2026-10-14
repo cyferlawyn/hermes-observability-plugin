@@ -94,3 +94,24 @@ def session_trace(session_id: str) -> dict[str, Any]:
         )
     except sqlite3.Error:
         raise HTTPException(status_code=503, detail="The connected profile's session database is unavailable.")
+
+
+@router.get("/sessions/{session_id}/calls/{call_id}/detail")
+def call_detail(session_id: str, call_id: str) -> dict[str, Any]:
+    """Read selected call detail from canonical source messages on demand."""
+    store, service, runtime = _core()
+    try:
+        with runtime.profile_connection() as conn:
+            if conn is None:
+                raise HTTPException(status_code=503, detail="No session database is available.")
+            result = service.call_detail(conn, session_id, call_id)
+            if result is None:
+                raise HTTPException(status_code=404, detail="Call or source session not found.")
+            return result
+    except store.UnsupportedSchemaVersion:
+        raise HTTPException(
+            status_code=503,
+            detail="Observability data uses a newer schema; this plugin will not interpret it.",
+        )
+    except sqlite3.Error:
+        raise HTTPException(status_code=503, detail="The connected profile's session database is unavailable.")

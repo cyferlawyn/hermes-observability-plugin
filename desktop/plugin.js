@@ -53,6 +53,12 @@ function outcomeLabel(outcome) {
   })[outcome] || 'Unknown'
 }
 
+function formatDetailValue(value) {
+  if (value === null || value === undefined) return 'Unavailable'
+  if (typeof value === 'string') return value
+  return JSON.stringify(value, null, 2)
+}
+
 function Metric({ label, value, detail }) {
   return jsxs('div', {
     style: { ...cardStyle, flex: '1 1 130px' },
@@ -71,6 +77,21 @@ function ControlRoom({ rest }) {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [details, setDetails] = useState({})
+  const [detailLoading, setDetailLoading] = useState('')
+
+  async function inspectCall(event) {
+    setDetailLoading(event.id)
+    setDetails(value => ({ ...value, [event.id]: null }))
+    try {
+      const detail = await rest(`/sessions/${encodeURIComponent(event.session_id)}/calls/${encodeURIComponent(event.id)}/detail`)
+      setDetails(value => ({ ...value, [event.id]: detail }))
+    } catch (err) {
+      setDetails(value => ({ ...value, [event.id]: { error: err?.message || 'Could not read source detail.' } }))
+    } finally {
+      setDetailLoading('')
+    }
+  }
 
   useEffect(() => {
     let live = true
@@ -158,7 +179,7 @@ function ControlRoom({ rest }) {
             !loading && sessions.length === 0 ? jsx('div', { style: mutedStyle, children: 'No sessions found.' }) : null,
             ...sessions.map(session => jsx('button', {
               type: 'button',
-              onClick: () => setSelectedId(session.id),
+              onClick: () => { setDetails({}); setSelectedId(session.id) },
               style: {
                 display: 'block', width: '100%', textAlign: 'left', padding: '8px 7px', marginBottom: 4,
                 border: '1px solid var(--ui-stroke-secondary)', borderRadius: 5,
@@ -190,7 +211,42 @@ function ControlRoom({ rest }) {
                   style: { marginTop: 5, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
                   children: [event.error_type ? `${event.error_type}: ` : '', event.error_message || 'Explicit failure; no message supplied.']
                 }) : null,
-                event.capture_state !== 'paired' ? jsx('div', { style: { ...mutedStyle, marginTop: 4 }, children: 'Lifecycle incomplete; outcome coverage is partial.' }) : null
+                event.capture_state !== 'paired' ? jsx('div', { style: { ...mutedStyle, marginTop: 4 }, children: 'Lifecycle incomplete; outcome coverage is partial.' }) : null,
+                jsx('button', {
+                  type: 'button', style: { ...buttonStyle, marginTop: 7 },
+                  onClick: () => inspectCall(event),
+                  children: detailLoading === event.id ? 'Loading source detail…' : 'Inspect source detail'
+                }),
+                details[event.id] ? (details[event.id].error
+                  ? jsx('div', { role: 'alert', style: { marginTop: 7 }, children: details[event.id].error })
+                  : details[event.id].available
+                    ? jsxs('div', { style: { marginTop: 8, display: 'grid', gap: 7 }, children: [
+                      jsxs('div', { children: [
+                        jsx('strong', { children: 'Arguments' }),
+                        jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '3px 0' }, children: formatDetailValue(details[event.id].source.arguments) })
+                      ] }),
+                      jsxs('div', { children: [
+                        jsx('strong', { children: 'Source result' }),
+                        details[event.id].source.result_status === 'ambiguous'
+                          ? jsx('div', { style: mutedStyle, children: 'Multiple exact source result records; result unavailable.' })
+                          : jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '3px 0' }, children: formatDetailValue(details[event.id].source.result) })
+                      ] }),
+                      details[event.id].call.error_type || details[event.id].call.error_message
+                        ? jsxs('div', { children: [
+                          jsx('strong', { children: 'Captured error' }),
+                          jsx('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: `${details[event.id].call.error_type ? `${details[event.id].call.error_type}: ` : ''}${details[event.id].call.error_message || ''}` })
+                        ] }) : null,
+                      jsxs('div', { children: [
+                        jsx('strong', { children: 'Nearby visible conversation' }),
+                        ...details[event.id].context.map((item, index) => jsxs('div', {
+                          style: { borderLeft: '2px solid var(--ui-stroke-secondary)', paddingLeft: 7, marginTop: 4, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
+                          children: [jsx('span', { style: mutedStyle, children: `${item.role}: ` }), item.content]
+                        }, `${index}-${item.role}`))
+                      ] })
+                    ] })
+                    : jsx('div', { style: { ...mutedStyle, marginTop: 7 }, children: details[event.id].source.status === 'ambiguous'
+                      ? 'Source record correlation is ambiguous; no source content was selected.'
+                      : 'No exact source session/tool-call match. Source context is unavailable; no fuzzy match was attempted.' })) : null
               ]
             }, event.id))
           ] })
