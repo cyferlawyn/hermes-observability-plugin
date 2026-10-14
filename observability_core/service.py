@@ -25,6 +25,9 @@ def overview(
         "sessions": store.list_sessions(
             conn, limit=session_limit, window=window, now=now, timezone_name=timezone_name
         ),
+        "repeated_failures": store.repeated_failure_findings(
+            conn, window=window, now=now, timezone_name=timezone_name
+        ),
     }
 
 
@@ -37,9 +40,9 @@ def session_trace(
     timezone_name: str | None = None,
 ) -> dict[str, Any] | None:
     """Return one source-session header and its captured observer metadata."""
-    session = next((item for item in store.list_sessions(
-        conn, limit=500, window=window, now=now, timezone_name=timezone_name
-    ) if item["id"] == session_id), None)
+    session = store.session_header(
+        conn, session_id, window=window, now=now, timezone_name=timezone_name
+    )
     if session is None:
         return None
     return {

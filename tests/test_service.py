@@ -33,6 +33,42 @@ class ServiceTests(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
+    def test_overview_contains_repeated_failure_findings_for_call_drilldown(self):
+        self.conn.execute(
+            "INSERT INTO sessions (id, started_at, title) VALUES (?, ?, ?)",
+            ("captured-2", 200.0, "Second captured"),
+        )
+        self.conn.commit()
+        store.register_session(self.conn, "captured-2", captured_at=210.0)
+        call_id = store.begin_tool_call(
+            self.conn, "captured-2", "mcp__browser__search", started_at=220.0, tool_call_id="t2"
+        )
+        store.complete_tool_call(
+            self.conn, call_id, "error", completed_at=221.0,
+            error_type="TimeoutError", error_message="request timed out"
+        )
+        self.conn.execute(
+            "UPDATE hermes_observability_calls SET tool_name = ? WHERE session_id = ?",
+            ("mcp__browser__search", "captured"),
+        )
+        self.conn.commit()
+
+        self.conn.executemany(
+            "INSERT INTO sessions (id, started_at, title) VALUES (?, ?, ?)",
+            [(f"recent-{index}", 1000.0 + index, f"Recent {index}") for index in range(501)],
+        )
+        self.conn.commit()
+        result = service.overview(self.conn, session_limit=1)
+
+        [finding] = result["repeated_failures"]
+        self.assertEqual(finding["tool_name"], "mcp__browser__search")
+        self.assertEqual(finding["affected_sessions"], 2)
+        self.assertEqual({item["session_id"] for item in finding["examples"]}, {"captured", "captured-2"})
+        self.assertNotIn("captured", [row["id"] for row in result["sessions"]])
+        old_example_trace = service.session_trace(self.conn, "captured")
+        self.assertEqual(old_example_trace["session"]["id"], "captured")
+        self.assertEqual(old_example_trace["calls"][0]["tool_name"], "mcp__browser__search")
+
     def test_overview_labels_uncaptured_sessions_and_reports_telemetry_counts(self):
         result = service.overview(self.conn)
 

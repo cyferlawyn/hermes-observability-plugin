@@ -52,6 +52,22 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(store.metrics(self.conn)["calls"]["total"], 1)
         self.assertNotIn("must not persist", repr(trace))
 
+    def test_optional_structured_error_code_is_captured_from_observer_payload(self):
+        self.collector.on_session_start(session_id="new-session")
+        self.collector.on_pre_tool_call(
+            session_id="new-session", tool_name="files.read", tool_call_id="code-call"
+        )
+        self.collector.on_post_tool_call(
+            session_id="new-session", tool_name="files.read", tool_call_id="code-call",
+            status="error", error_code="E_CONN_RESET", error_type="ConnectionError",
+            error_message="connection reset",
+        )
+
+        [call] = store.session_trace(self.conn, "new-session")
+
+        self.assertEqual(call["error_code"], "E_CONN_RESET")
+        self.assertEqual(call["outcome"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

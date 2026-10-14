@@ -18,7 +18,8 @@ class Collector:
     def __init__(self, connection_factory: Callable[[], Any]):
         self._connection_factory = connection_factory
         self._eligible: set[str] = set()
-        self._pending: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
+        self._pending: dict[tuple[str, ...], deque[str]] = defaultdict(deque)
+        self._ambiguous_pending_keys: set[tuple[str, ...]] = set()
         self._lock = threading.RLock()
 
     def _connection(self):
@@ -63,6 +64,9 @@ class Collector:
             self._eligible.discard(session_id)
             for key in [key for key in self._pending if key[0] == session_id]:
                 self._pending.pop(key, None)
+            self._ambiguous_pending_keys = {
+                key for key in self._ambiguous_pending_keys if key[0] != session_id
+            }
 
     def on_pre_tool_call(self, **kwargs: Any) -> None:
         session_id = str(kwargs.get("session_id") or "")
@@ -88,9 +92,12 @@ class Collector:
                     tool_call_id=tool_call_id,
                 )
             if event_id:
-                match_key = (session_id, "id", tool_call_id) if tool_call_id else (session_id, "name", tool_name)
+                match_key = _tool_call_match_key(
+                    session_id, tool_name, tool_call_id, kwargs.get("turn_id"), kwargs.get("api_request_id")
+                )
                 with self._lock:
-                    self._pending[match_key].append(event_id)
+                    if match_key not in self._ambiguous_pending_keys:
+                        self._pending[match_key].append(event_id)
         except Exception:
             # Hermes observer hooks are fail-open; telemetry must never break the agent loop.
             log.warning("observability: failed to record tool start", exc_info=True)
@@ -101,12 +108,25 @@ class Collector:
             return
         tool_name = str(kwargs.get("tool_name") or "unknown")
         tool_call_id = str(kwargs.get("tool_call_id") or "") or None
-        match_key = (session_id, "id", tool_call_id) if tool_call_id else (session_id, "name", tool_name)
+        match_key = _tool_call_match_key(
+            session_id, tool_name, tool_call_id, kwargs.get("turn_id"), kwargs.get("api_request_id")
+        )
         with self._lock:
             pending = self._pending.get(match_key)
-            event_id = pending.popleft() if pending else None
-            if pending is not None and not pending:
-                self._pending.pop(match_key, None)
+            if match_key in self._ambiguous_pending_keys:
+                event_id = None
+            elif pending and (tool_call_id or len(pending) == 1):
+                event_id = pending.popleft()
+                if not pending:
+                    self._pending.pop(match_key, None)
+            else:
+                event_id = None
+                if pending:
+                    # Without a call ID, multiple starts sharing the remaining
+                    # key cannot be safely correlated to this completion. Quarantine
+                    # the key until session finalization in case late hooks arrive.
+                    self._pending.pop(match_key, None)
+                    self._ambiguous_pending_keys.add(match_key)
         try:
             with self._connection() as conn:
                 if conn is None or not store.register_session(
@@ -122,6 +142,7 @@ class Collector:
                         completed_at=time.time(),
                         duration_ms=_optional_float(kwargs.get("duration_ms")),
                         error_type=kwargs.get("error_type"),
+                        error_code=kwargs.get("error_code"),
                         error_message=kwargs.get("error_message"),
                     )
                     if not completed:
@@ -137,6 +158,7 @@ class Collector:
                             api_request_id=_optional_text(kwargs.get("api_request_id")),
                             tool_call_id=tool_call_id,
                             error_type=kwargs.get("error_type"),
+                            error_code=kwargs.get("error_code"),
                             error_message=kwargs.get("error_message"),
                         )
                 else:
@@ -152,6 +174,7 @@ class Collector:
                         api_request_id=_optional_text(kwargs.get("api_request_id")),
                         tool_call_id=tool_call_id,
                         error_type=kwargs.get("error_type"),
+                        error_code=kwargs.get("error_code"),
                         error_message=kwargs.get("error_message"),
                     )
         except Exception:
@@ -160,6 +183,31 @@ class Collector:
     def _is_eligible(self, session_id: str) -> bool:
         with self._lock:
             return session_id in self._eligible
+
+
+def _tool_call_match_key(
+    session_id: str,
+    tool_name: str,
+    tool_call_id: str | None,
+    turn_id: Any,
+    api_request_id: Any,
+) -> tuple[str, ...]:
+    if tool_call_id:
+        return (
+            session_id,
+            "id",
+            tool_name,
+            _optional_text(turn_id) or "",
+            _optional_text(api_request_id) or "",
+            tool_call_id,
+        )
+    return (
+        session_id,
+        "name",
+        tool_name,
+        _optional_text(turn_id) or "",
+        _optional_text(api_request_id) or "",
+    )
 
 
 def _observer_schema_version(kwargs: dict[str, Any]) -> str:
