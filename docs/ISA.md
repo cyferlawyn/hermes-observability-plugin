@@ -198,7 +198,20 @@ A user-triggered Analyze session is included; any remediation remains separately
 
 ## 14. Source decisions and references
 
-This artifact consolidates the resolved decision tickets in `issues/01-...` through `issues/10-...` and the coverage terminology in [GLOSSARY.md](GLOSSARY.md). The chosen prototype is [session-overview.html](prototype/session-overview.html).
+Decision provenance is preserved in the [GitHub Wayfinder map](https://github.com/cyferlawyn/hermes-observability-plugin/issues/1) and its closed child issues:
+
+- [Define the inspectable trace and “thinking exchange”](https://github.com/cyferlawyn/hermes-observability-plugin/issues/2)
+- [Choose the first-release diagnostic workflows](https://github.com/cyferlawyn/hermes-observability-plugin/issues/3)
+- [Define call outcomes and trustworthy metrics](https://github.com/cyferlawyn/hermes-observability-plugin/issues/4)
+- [Set the telemetry privacy and retention boundary](https://github.com/cyferlawyn/hermes-observability-plugin/issues/5)
+- [Choose where the observability experience lives](https://github.com/cyferlawyn/hermes-observability-plugin/issues/6)
+- [Choose the event capture and storage architecture](https://github.com/cyferlawyn/hermes-observability-plugin/issues/7)
+- [Prototype the session overview and trace drill-down](https://github.com/cyferlawyn/hermes-observability-plugin/issues/8)
+- [Set ISA acceptance criteria and first-release boundary](https://github.com/cyferlawyn/hermes-observability-plugin/issues/9)
+- [Decide how telemetry should guide tool/MCP instruction improvements](https://github.com/cyferlawyn/hermes-observability-plugin/issues/10)
+- [Define trace coverage and cross-session comparability](https://github.com/cyferlawyn/hermes-observability-plugin/issues/11)
+
+Coverage terminology is defined in [GLOSSARY.md](GLOSSARY.md). The chosen prototype is [session-overview.html](prototype/session-overview.html).
 
 Relevant Hermes references:
 
