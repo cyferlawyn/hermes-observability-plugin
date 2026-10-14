@@ -55,6 +55,27 @@ class ServiceTests(unittest.TestCase):
     def test_trace_response_is_none_for_unknown_session(self):
         self.assertIsNone(service.session_trace(self.conn, "missing"))
 
+    def test_selected_window_filters_overview_metrics_sessions_and_session_trace(self):
+        self.conn.execute(
+            "INSERT INTO sessions (id, started_at, title) VALUES (?, ?, ?)",
+            ("after-reset", 200.0, "After reset"),
+        )
+        self.conn.commit()
+        store.register_session(self.conn, "after-reset", captured_at=210.0)
+        call_id = store.begin_tool_call(self.conn, "after-reset", "files.read", started_at=220.0)
+        assert call_id is not None
+        store.complete_tool_call(self.conn, call_id, "ok", completed_at=221.0)
+        store.reset_metrics(self.conn, reset_at=150.0)
+
+        result = service.overview(self.conn, window="Since Reset")
+
+        self.assertEqual(result["window"], "Since Reset")
+        self.assertEqual([row["id"] for row in result["sessions"]], ["after-reset"])
+        self.assertEqual(result["metrics"]["included_sessions"], 1)
+        self.assertEqual(result["metrics"]["calls"]["total"], 1)
+        self.assertIsNone(service.session_trace(self.conn, "captured", window="Since Reset"))
+        self.assertIsNotNone(service.session_trace(self.conn, "after-reset", window="Since Reset"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,9 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
+from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SCHEMA_VERSION = 1
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
@@ -251,14 +253,83 @@ def call_record(conn: sqlite3.Connection, session_id: str, call_id: str) -> dict
     return dict(row) if row else None
 
 
-def list_sessions(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]]:
+def reset_metrics(conn: sqlite3.Connection, *, reset_at: float | None = None) -> float:
+    """Advance the Since Reset cutoff without changing sessions or telemetry rows."""
+    candidate = float(reset_at if reset_at is not None else time.time())
+    previous = _reset_cutoff(conn)
+    cutoff = max(candidate, previous + 0.000001) if previous is not None else candidate
+    conn.execute(
+        f"INSERT INTO {_META_TABLE}(key, value) VALUES ('reset_cutoff', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (repr(cutoff),),
+    )
+    conn.commit()
+    return cutoff
+
+
+def _reset_cutoff(conn: sqlite3.Connection) -> float | None:
+    row = conn.execute("SELECT value FROM hermes_observability_meta WHERE key = 'reset_cutoff'").fetchone()
+    return float(row[0]) if row else None
+
+
+def _today_bounds(now: float, timezone_name: str | None = None) -> tuple[float, float]:
+    """Return local calendar-day bounds, including correct DST transitions."""
+    if timezone_name:
+        try:
+            zone = ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("invalid IANA timezone") from exc
+        day = datetime.fromtimestamp(now, zone).date()
+        next_day = day + timedelta(days=1)
+        start = datetime.combine(day, datetime_time.min, tzinfo=zone).timestamp()
+        end = datetime.combine(next_day, datetime_time.min, tzinfo=zone).timestamp()
+        return start, end
+    local = time.localtime(now)
+    day = date(local.tm_year, local.tm_mon, local.tm_mday)
+    next_day = day + timedelta(days=1)
+    start = time.mktime((day.year, day.month, day.day, 0, 0, 0, 0, 0, -1))
+    end = time.mktime((next_day.year, next_day.month, next_day.day, 0, 0, 0, 0, 0, -1))
+    return start, end
+
+
+def _session_window(
+    window: str,
+    now: float,
+    reset_cutoff: float | None,
+    alias: str = "s",
+    timezone_name: str | None = None,
+) -> tuple[str, tuple[float, ...]]:
+    if window == "Overall":
+        return "1 = 1", ()
+    if window == "Today":
+        start, end = _today_bounds(now, timezone_name)
+        return f"{alias}.started_at >= ? AND {alias}.started_at < ?", (start, end)
+    if window == "Since Reset":
+        if reset_cutoff is None:
+            return "1 = 1", ()
+        return f"{alias}.started_at >= ?", (reset_cutoff,)
+    raise ValueError("window must be Overall, Today, or Since Reset")
+
+
+def list_sessions(
+    conn: sqlite3.Connection,
+    limit: int = 100,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> list[dict[str, Any]]:
     """List session headers and explicit coverage labels, newest first."""
     limit = max(1, min(int(limit), 500))
+    current = float(now if now is not None else time.time())
+    predicate, params = _session_window(
+        window, current, _reset_cutoff(conn), timezone_name=timezone_name
+    )
     rows = conn.execute(
         f"SELECT s.id, s.title, s.started_at, s.ended_at, o.captured_at, "
         f"o.observer_schema_version FROM sessions s LEFT JOIN {_SESSIONS_TABLE} o "
-        "ON o.session_id = s.id ORDER BY s.started_at DESC LIMIT ?",
-        (limit,),
+        f"ON o.session_id = s.id WHERE {predicate} ORDER BY s.started_at DESC LIMIT ?",
+        (*params, limit),
     ).fetchall()
     result = []
     for row in rows:
@@ -275,10 +346,25 @@ def list_sessions(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, 
     return result
 
 
-def metrics(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Aggregate observed counts; calculate rates only over compatible, gap-free sessions."""
+def metrics(
+    conn: sqlite3.Connection,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate counts and coverage within one whole-session time window."""
+    current = float(now if now is not None else time.time())
+    reset_cutoff = _reset_cutoff(conn)
+    predicate, params = _session_window(
+        window, current, reset_cutoff, timezone_name=timezone_name
+    )
     counts = {"total": 0, "ok": 0, "failed": 0, "not_executed": 0, "unknown": 0}
-    for row in conn.execute(f"SELECT outcome, COUNT(*) AS n FROM {_CALLS_TABLE} GROUP BY outcome"):
+    for row in conn.execute(
+        f"SELECT c.outcome, COUNT(*) AS n FROM {_CALLS_TABLE} c "
+        f"JOIN sessions s ON s.id = c.session_id WHERE {predicate} GROUP BY c.outcome",
+        params,
+    ):
         key = row["outcome"]
         if key in counts:
             counts[key] = int(row["n"])
@@ -287,41 +373,53 @@ def metrics(conn: sqlite3.Connection) -> dict[str, Any]:
     rate_counts = {"ok": 0, "failed": 0, "denominator": 0}
     compatible = (
         f"SELECT o.session_id FROM {_SESSIONS_TABLE} o "
-        "WHERE o.observer_schema_version = ? AND NOT EXISTS ("
+        "JOIN sessions s ON s.id = o.session_id "
+        f"WHERE {predicate} AND o.observer_schema_version = ? AND NOT EXISTS ("
         f"SELECT 1 FROM {_CALLS_TABLE} c WHERE c.session_id = o.session_id "
         "AND (c.capture_state != 'paired' OR c.outcome = 'unknown'))"
     )
+    compatible_params = (*params, OBSERVER_SCHEMA_VERSION)
     for row in conn.execute(
         f"SELECT c.outcome, COUNT(*) AS n FROM {_CALLS_TABLE} c "
         f"JOIN ({compatible}) eligible ON eligible.session_id = c.session_id "
         "WHERE c.outcome IN ('ok', 'failed') GROUP BY c.outcome",
-        (OBSERVER_SCHEMA_VERSION,),
+        compatible_params,
     ):
         rate_counts[row["outcome"]] = int(row["n"])
     rate_counts["denominator"] = rate_counts["ok"] + rate_counts["failed"]
 
-    total_sessions = int(conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
-    captured_sessions = int(conn.execute(f"SELECT COUNT(*) FROM {_SESSIONS_TABLE}").fetchone()[0])
+    total_sessions = int(conn.execute(
+        f"SELECT COUNT(*) FROM sessions s WHERE {predicate}", params
+    ).fetchone()[0])
+    captured_sessions = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_SESSIONS_TABLE} o JOIN sessions s ON s.id = o.session_id "
+        f"WHERE {predicate}", params
+    ).fetchone()[0])
     observed_sessions = int(conn.execute(
-        f"SELECT COUNT(*) FROM ({compatible})", (OBSERVER_SCHEMA_VERSION,)
+        f"SELECT COUNT(*) FROM ({compatible})", compatible_params
     ).fetchone()[0])
     partial_sessions = int(conn.execute(
-        f"SELECT COUNT(*) FROM {_SESSIONS_TABLE} o WHERE o.observer_schema_version = ? "
+        f"SELECT COUNT(*) FROM {_SESSIONS_TABLE} o JOIN sessions s ON s.id = o.session_id "
+        f"WHERE {predicate} AND o.observer_schema_version = ? "
         f"AND EXISTS (SELECT 1 FROM {_CALLS_TABLE} c WHERE c.session_id = o.session_id "
         "AND (c.capture_state != 'paired' OR c.outcome = 'unknown'))",
-        (OBSERVER_SCHEMA_VERSION,),
+        compatible_params,
     ).fetchone()[0])
     unknown_sessions = max(0, captured_sessions - observed_sessions - partial_sessions)
     success_rate = (
         rate_counts["ok"] / rate_counts["denominator"] if rate_counts["denominator"] else None
     )
     return {
+        "window": window,
+        "reset_cutoff": reset_cutoff,
         "calls": counts,
         "rate_calls": rate_counts,
         "success_rate": success_rate,
         "total_sessions": total_sessions,
+        "included_sessions": total_sessions,
         "captured_sessions": captured_sessions,
         "observed_sessions": observed_sessions,
+        "rate_included_sessions": observed_sessions,
         "partial_sessions": partial_sessions,
         "unknown_sessions": unknown_sessions,
         "excluded_sessions": max(0, total_sessions - captured_sessions),

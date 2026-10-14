@@ -8,8 +8,10 @@ const EMPTY_METRICS = {
   rate_calls: { ok: 0, failed: 0, denominator: 0 },
   success_rate: null,
   total_sessions: 0,
+  included_sessions: 0,
   captured_sessions: 0,
   observed_sessions: 0,
+  rate_included_sessions: 0,
   partial_sessions: 0,
   unknown_sessions: 0,
   excluded_sessions: 0,
@@ -77,8 +79,11 @@ function ControlRoom({ rest }) {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [timeWindow, setTimeWindow] = useState('Overall')
+  const [resetting, setResetting] = useState(false)
   const [details, setDetails] = useState({})
   const [detailLoading, setDetailLoading] = useState('')
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 
   async function inspectCall(event) {
     setDetailLoading(event.id)
@@ -93,11 +98,26 @@ function ControlRoom({ rest }) {
     }
   }
 
+  async function resetMetrics() {
+    setResetting(true)
+    setError('')
+    try {
+      await rest('/reset', { method: 'POST' })
+      setSelectedId('')
+      setTimeWindow('Since Reset')
+      setRefreshKey(value => value + 1)
+    } catch (err) {
+      setError(err?.message || 'Could not reset the metrics window.')
+    } finally {
+      setResetting(false)
+    }
+  }
+
   useEffect(() => {
     let live = true
     setLoading(true)
     setError('')
-    rest('/overview')
+    rest(`/overview?window=${encodeURIComponent(timeWindow)}&timezone=${encodeURIComponent(timezone)}`)
       .then(data => {
         if (!live) return
         setOverview(data)
@@ -109,7 +129,7 @@ function ControlRoom({ rest }) {
       .catch(err => { if (live) setError(err?.message || 'Could not read this profile’s telemetry.') })
       .finally(() => { if (live) setLoading(false) })
     return () => { live = false }
-  }, [rest, refreshKey])
+  }, [rest, refreshKey, timeWindow, timezone])
 
   useEffect(() => {
     if (!selectedId) {
@@ -118,11 +138,11 @@ function ControlRoom({ rest }) {
     }
     let live = true
     setTrace(null)
-    rest(`/sessions/${encodeURIComponent(selectedId)}/trace`)
+    rest(`/sessions/${encodeURIComponent(selectedId)}/trace?window=${encodeURIComponent(timeWindow)}&timezone=${encodeURIComponent(timezone)}`)
       .then(data => { if (live) setTrace(data) })
       .catch(err => { if (live) setError(err?.message || 'Could not read this session trace.') })
     return () => { live = false }
-  }, [rest, selectedId, refreshKey])
+  }, [rest, selectedId, refreshKey, timeWindow, timezone])
 
   const sessions = Array.isArray(overview?.sessions) ? overview.sessions : []
   const metrics = overview?.metrics || EMPTY_METRICS
@@ -130,6 +150,11 @@ function ControlRoom({ rest }) {
   const rateCalls = metrics.rate_calls || EMPTY_METRICS.rate_calls
   const rate = metrics.success_rate === null || metrics.success_rate === undefined
     ? '—' : `${(metrics.success_rate * 100).toFixed(1)}%`
+  const windowDescription = timeWindow === 'Today'
+    ? 'Today uses the connected profile’s local calendar day.'
+    : timeWindow === 'Since Reset'
+      ? `Sessions started at or after the latest reset cutoff${metrics.reset_cutoff == null ? ' (no reset has been recorded)' : ` (${displayTime(metrics.reset_cutoff)})`}.`
+      : 'Overall includes all still-available sessions.'
   const selected = sessions.find(session => session.id === selectedId)
   const events = Array.isArray(trace?.calls) ? trace.calls : []
 
@@ -143,11 +168,29 @@ function ControlRoom({ rest }) {
             jsx('h1', { style: { fontSize: 18, margin: '0 0 3px' }, children: 'Control room' }),
             jsx('div', { style: mutedStyle, children: 'Prospective operational traces for the connected profile.' })
           ] }),
-          jsx('button', {
-            type: 'button', style: buttonStyle,
-            onClick: () => setRefreshKey(value => value + 1),
-            children: loading ? 'Loading…' : 'Refresh'
-          })
+          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }, children: [
+            jsx('select', {
+              'aria-label': 'Metrics time window',
+              value: timeWindow,
+              onChange: event => { setDetails({}); setSelectedId(''); setTimeWindow(event.target.value) },
+              style: { ...buttonStyle, padding: '5px 7px' },
+              children: [
+                jsx('option', { value: 'Overall', children: 'Overall' }),
+                jsx('option', { value: 'Today', children: 'Today' }),
+                jsx('option', { value: 'Since Reset', children: 'Since Reset' })
+              ]
+            }),
+            jsx('button', {
+              type: 'button', style: buttonStyle, disabled: resetting,
+              onClick: resetMetrics,
+              children: resetting ? 'Resetting…' : 'Reset Metrics'
+            }),
+            jsx('button', {
+              type: 'button', style: buttonStyle,
+              onClick: () => setRefreshKey(value => value + 1),
+              children: loading ? 'Loading…' : 'Refresh'
+            })
+          ] })
         ]
       }),
       error ? jsx('div', {
@@ -161,14 +204,14 @@ function ControlRoom({ rest }) {
         style: { display: 'flex', flexWrap: 'wrap', gap: 8 },
         children: [
           jsx(Metric, { label: 'Observed tool calls', value: calls.total, detail: `${calls.ok} success · ${calls.failed} failed` }),
-          jsx(Metric, { label: 'Success rate', value: rate, detail: `${rateCalls.denominator} explicit outcomes · ${metrics.rate_excluded_sessions || 0} sessions excluded for coverage` }),
+          jsx(Metric, { label: 'Success rate', value: rate, detail: `${rateCalls.denominator} explicit outcomes · ${metrics.rate_included_sessions || 0} eligible / ${metrics.rate_excluded_sessions || 0} excluded for coverage` }),
           jsx(Metric, { label: 'Not executed / unknown', value: `${calls.not_executed} / ${calls.unknown}`, detail: 'Excluded from rate denominator' }),
-          jsx(Metric, { label: 'Coverage', value: `${metrics.observed_sessions || 0} rate-eligible`, detail: `${metrics.partial_sessions || 0} partial · ${metrics.unknown_sessions || 0} unknown · ${metrics.excluded_sessions || 0} not captured` })
+          jsx(Metric, { label: 'Coverage', value: `${metrics.included_sessions || 0} sessions included`, detail: `${metrics.observed_sessions || 0} rate-eligible · ${metrics.partial_sessions || 0} partial · ${metrics.unknown_sessions || 0} unknown · ${metrics.excluded_sessions || 0} not captured` })
         ]
       }),
       jsx('div', {
         style: { ...mutedStyle, fontSize: 11 },
-        children: 'Overall window only in this MVP slice. Rates exclude partial/unknown/uncaptured sessions; observed counts from incomplete sessions are lower-bound evidence. “Observed — no known gaps” is not a completeness guarantee because observer hooks fail open.'
+        children: `${timeWindow} window. ${windowDescription} Sessions are included by start time; a session crossing a boundary stays wholly on its start side. Rates use only compatible observed sessions; excluded coverage remains visible. Observed counts from incomplete sessions are lower-bound evidence. “Observed — no known gaps” is not a completeness guarantee because observer hooks fail open.`
       }),
       jsxs('div', {
         style: { display: 'grid', gridTemplateColumns: 'minmax(190px, 0.8fr) minmax(280px, 1.7fr)', gap: 10, minHeight: 280 },
