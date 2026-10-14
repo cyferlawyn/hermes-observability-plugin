@@ -60,6 +60,7 @@ def _unavailable(window: str = "Overall") -> dict[str, Any]:
             "rate_excluded_sessions": 0,
         },
         "sessions": [],
+        "repeated_failures": [],
     }
 
 

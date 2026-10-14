@@ -12,7 +12,9 @@ from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-SCHEMA_VERSION = 1
+from . import repeated_failures
+
+SCHEMA_VERSION = 2
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 _META_TABLE = "hermes_observability_meta"
 _SESSIONS_TABLE = "hermes_observability_sessions"
@@ -44,7 +46,9 @@ CREATE TABLE IF NOT EXISTS {_CALLS_TABLE} (
     outcome TEXT NOT NULL DEFAULT 'unknown'
         CHECK (outcome IN ('ok', 'failed', 'not_executed', 'unknown')),
     error_type TEXT,
+    error_code TEXT,
     error_message TEXT,
+    failure_status TEXT,
     capture_state TEXT NOT NULL DEFAULT 'start_only'
         CHECK (capture_state IN ('paired', 'start_only', 'post_only'))
 );
@@ -70,6 +74,13 @@ def initialize(conn: sqlite3.Connection) -> None:
             f"telemetry schema {current} is newer than supported schema {SCHEMA_VERSION}"
         )
     conn.executescript(_SCHEMA)
+    call_columns = {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({_CALLS_TABLE})")
+    }
+    if "error_code" not in call_columns:
+        conn.execute(f"ALTER TABLE {_CALLS_TABLE} ADD COLUMN error_code TEXT")
+    if "failure_status" not in call_columns:
+        conn.execute(f"ALTER TABLE {_CALLS_TABLE} ADD COLUMN failure_status TEXT")
     conn.execute(
         f"INSERT INTO {_META_TABLE}(key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -134,7 +145,8 @@ def normalize_outcome(status: Any) -> str:
     value = str(status or "").strip().lower()
     if value in {"ok", "success"}:
         return "ok"
-    if value in {"error", "failed", "failure"}:
+    if value in {"error", "failed", "failure", "timeout", "timed_out", "timed-out",
+                 "partial_failure", "partial-failure", "partial failure"}:
         return "failed"
     if value in {"blocked", "cancelled", "canceled"}:
         return "not_executed"
@@ -148,6 +160,12 @@ def _bounded(value: Any, limit: int = 2000) -> str | None:
     return text[:limit]
 
 
+def _failure_status(status: Any) -> str | None:
+    if normalize_outcome(status) != "failed" or status is None:
+        return None
+    return _bounded(str(status).strip().lower(), 64)
+
+
 def complete_tool_call(
     conn: sqlite3.Connection,
     call_id: str,
@@ -156,15 +174,17 @@ def complete_tool_call(
     completed_at: float | None = None,
     duration_ms: float | None = None,
     error_type: Any = None,
+    error_code: Any = None,
     error_message: Any = None,
 ) -> bool:
     """Close one started invocation using only the explicit observer outcome."""
     cursor = conn.execute(
         f"UPDATE {_CALLS_TABLE} SET completed_at = ?, duration_ms = ?, outcome = ?, "
-        "error_type = ?, error_message = ?, capture_state = 'paired' "
+        "error_type = ?, error_code = ?, error_message = ?, failure_status = ?, capture_state = 'paired' "
         "WHERE id = ? AND completed_at IS NULL",
         (float(completed_at if completed_at is not None else time.time()), duration_ms,
-         normalize_outcome(status), _bounded(error_type, 256), _bounded(error_message), call_id),
+         normalize_outcome(status), _bounded(error_type, 256), _bounded(error_code, 256),
+         _bounded(error_message), _failure_status(status), call_id),
     )
     conn.commit()
     return cursor.rowcount == 1
@@ -183,20 +203,22 @@ def record_post_only_call(
     api_request_id: str | None = None,
     tool_call_id: str | None = None,
     error_type: Any = None,
+    error_code: Any = None,
     error_message: Any = None,
 ) -> str | None:
     """Record a post hook that had no matching start as visible, partial evidence."""
+    normalized_tool_name = str(tool_name or "unknown")
     if conn.execute(
         f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
     ).fetchone() is None:
         return None
     if tool_call_id:
         existing = conn.execute(
-            f"SELECT id FROM {_CALLS_TABLE} WHERE session_id = ? AND tool_call_id = ? "
+            f"SELECT id FROM {_CALLS_TABLE} WHERE session_id = ? AND tool_name = ? AND tool_call_id = ? "
             "AND COALESCE(turn_id, '') = COALESCE(?, '') "
             "AND COALESCE(api_request_id, '') = COALESCE(?, '') "
             "AND completed_at IS NOT NULL LIMIT 1",
-            (session_id, tool_call_id, turn_id, api_request_id),
+            (session_id, normalized_tool_name, tool_call_id, turn_id, api_request_id),
         ).fetchone()
         if existing:
             return str(existing[0])
@@ -204,11 +226,12 @@ def record_post_only_call(
     conn.execute(
         f"INSERT INTO {_CALLS_TABLE} "
         "(id, session_id, tool_name, task_id, turn_id, api_request_id, tool_call_id, "
-        "completed_at, duration_ms, outcome, error_type, error_message, capture_state) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'post_only')",
-        (call_id, session_id, str(tool_name or "unknown"), task_id, turn_id, api_request_id,
+        "completed_at, duration_ms, outcome, error_type, error_code, error_message, failure_status, capture_state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'post_only')",
+        (call_id, session_id, normalized_tool_name, task_id, turn_id, api_request_id,
          tool_call_id, float(completed_at if completed_at is not None else time.time()), duration_ms,
-         normalize_outcome(status), _bounded(error_type, 256), _bounded(error_message)),
+         normalize_outcome(status), _bounded(error_type, 256), _bounded(error_code, 256),
+         _bounded(error_message), _failure_status(status)),
     )
     conn.commit()
     return call_id
@@ -235,7 +258,7 @@ def session_trace(conn: sqlite3.Connection, session_id: str) -> list[dict[str, A
         return []
     rows = conn.execute(
         f"SELECT id, session_id, tool_name, task_id, turn_id, api_request_id, tool_call_id, "
-        "started_at, completed_at, duration_ms, outcome, error_type, error_message, capture_state "
+        "started_at, completed_at, duration_ms, outcome, error_type, error_code, error_message, capture_state "
         f"FROM {_CALLS_TABLE} WHERE session_id = ? ORDER BY COALESCE(started_at, completed_at), id",
         (session_id,),
     ).fetchall()
@@ -246,7 +269,7 @@ def call_record(conn: sqlite3.Connection, session_id: str, call_id: str) -> dict
     """Return one captured call's metadata, scoped to its exact source session."""
     row = conn.execute(
         f"SELECT id, session_id, tool_name, tool_call_id, started_at, completed_at, "
-        f"duration_ms, outcome, error_type, error_message FROM {_CALLS_TABLE} "
+        f"duration_ms, outcome, error_type, error_code, error_message FROM {_CALLS_TABLE} "
         "WHERE session_id = ? AND id = ?",
         (session_id, call_id),
     ).fetchone()
@@ -346,6 +369,39 @@ def list_sessions(
     return result
 
 
+def session_header(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Fetch one exact session header without the recent-session list limit."""
+    current = float(now if now is not None else time.time())
+    predicate, params = _session_window(
+        window, current, _reset_cutoff(conn), timezone_name=timezone_name
+    )
+    row = conn.execute(
+        f"SELECT s.id, s.title, s.started_at, s.ended_at, o.captured_at, "
+        f"o.observer_schema_version FROM sessions s LEFT JOIN {_SESSIONS_TABLE} o "
+        f"ON o.session_id = s.id WHERE s.id = ? AND ({predicate}) LIMIT 1",
+        (session_id, *params),
+    ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    version = item.pop("observer_schema_version")
+    item["coverage_state"] = (
+        "not_captured" if item["captured_at"] is None
+        else _coverage_state(conn, item["id"], version)
+    )
+    item["call_count"] = conn.execute(
+        f"SELECT COUNT(*) FROM {_CALLS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone()[0]
+    return item
+
+
 def metrics(
     conn: sqlite3.Connection,
     *,
@@ -425,3 +481,29 @@ def metrics(
         "excluded_sessions": max(0, total_sessions - captured_sessions),
         "rate_excluded_sessions": max(0, total_sessions - observed_sessions),
     }
+
+
+def repeated_failure_findings(
+    conn: sqlite3.Connection,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return deterministic cross-session failure evidence for the selected window."""
+    current = float(now if now is not None else time.time())
+    predicate, params = _session_window(
+        window, current, _reset_cutoff(conn), timezone_name=timezone_name
+    )
+    population = metrics(conn, window=window, now=current, timezone_name=timezone_name)
+    rows = conn.execute(
+        f"SELECT c.id, c.session_id, c.tool_name, c.turn_id, c.api_request_id, c.tool_call_id, c.started_at, "
+        "c.completed_at, c.outcome, c.error_type, c.error_code, c.error_message, c.failure_status "
+        f"FROM {_CALLS_TABLE} c JOIN sessions s ON s.id = c.session_id "
+        f"WHERE {predicate} AND c.outcome = 'failed' "
+        "ORDER BY COALESCE(c.completed_at, c.started_at), c.id",
+        params,
+    ).fetchall()
+    return repeated_failures.build_findings(
+        rows, population_excluded_sessions=population["rate_excluded_sessions"]
+    )

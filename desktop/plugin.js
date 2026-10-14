@@ -55,6 +55,17 @@ function outcomeLabel(outcome) {
   })[outcome] || 'Unknown'
 }
 
+function matchBasisLabel(basis) {
+  return ({
+    structured_error_code: 'Structured error code',
+    structured_error_type: 'Structured error type',
+    exact_error_message: 'Exact error message',
+    exact_message_masked_uuid: 'Exact message; UUIDs masked',
+    exact_message_masked_timestamp: 'Exact message; ISO timestamps masked',
+    exact_message_masked_uuid_timestamp: 'Exact message; UUIDs and ISO timestamps masked'
+  })[basis] || 'Deterministic exact match'
+}
+
 function formatDetailValue(value) {
   if (value === null || value === undefined) return 'Unavailable'
   if (typeof value === 'string') return value
@@ -96,6 +107,12 @@ function ControlRoom({ rest }) {
     } finally {
       setDetailLoading('')
     }
+  }
+
+  function inspectFindingExample(example) {
+    setDetails({})
+    setSelectedId(example.session_id)
+    inspectCall({ id: example.call_id, session_id: example.session_id })
   }
 
   async function resetMetrics() {
@@ -156,7 +173,10 @@ function ControlRoom({ rest }) {
       ? `Sessions started at or after the latest reset cutoff${metrics.reset_cutoff == null ? ' (no reset has been recorded)' : ` (${displayTime(metrics.reset_cutoff)})`}.`
       : 'Overall includes all still-available sessions.'
   const selected = sessions.find(session => session.id === selectedId)
+    || (trace?.session?.id === selectedId ? trace.session : null)
   const events = Array.isArray(trace?.calls) ? trace.calls : []
+  const findings = Array.isArray(overview?.repeated_failures) ? overview.repeated_failures : []
+  const findingsCoverageIncomplete = Number(metrics.rate_excluded_sessions || 0) > 0
 
   return jsxs('div', {
     style: rootStyle,
@@ -213,6 +233,49 @@ function ControlRoom({ rest }) {
         style: { ...mutedStyle, fontSize: 11 },
         children: `${timeWindow} window. ${windowDescription} Sessions are included by start time; a session crossing a boundary stays wholly on its start side. Rates use only compatible observed sessions; excluded coverage remains visible. Observed counts from incomplete sessions are lower-bound evidence. “Observed — no known gaps” is not a completeness guarantee because observer hooks fail open.`
       }),
+      jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsxs('div', { children: [
+            jsx('h2', { style: { fontSize: 13, margin: '0 0 3px' }, children: 'Repeated failures' }),
+            jsx('div', { style: mutedStyle, children: 'Exact tool identity; structured error code/type preferred, otherwise exact message with UUID/ISO-timestamp masking only. No fuzzy grouping or generated remediation.' })
+          ] }),
+          findings.length === 0
+            ? jsx('div', {
+              style: { ...mutedStyle, marginTop: 8 },
+              children: overview === null
+                ? 'Loading repeated-failure evidence…'
+                : findingsCoverageIncomplete
+                  ? 'No qualifying signature found in observed events. Coverage is incomplete, so this is not evidence that failures are absent.'
+                  : 'No qualifying cross-session failure signature in this window.'
+            })
+            : findings.map(finding => jsxs('article', {
+              style: { borderTop: '1px solid var(--ui-stroke-secondary)', padding: '9px 0 3px', marginTop: 8 },
+              children: [
+                jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8 }, children: [
+                  jsxs('strong', { children: [finding.identity_kind === 'mcp' ? 'MCP · ' : 'Tool · ', finding.tool_name] }),
+                  jsx('span', { style: mutedStyle, children: finding.at_least_n_observed
+                    ? `At least ${finding.distinct_failed_calls} observed failed invocations · ${finding.affected_sessions} sessions`
+                    : `${finding.distinct_failed_calls} distinct failed invocations · ${finding.affected_sessions} sessions` })
+                ] }),
+                jsxs('div', { style: { marginTop: 4, overflowWrap: 'anywhere' }, children: [
+                  jsx('strong', { children: `${matchBasisLabel(finding.match_basis)}: ` }), finding.signature
+                ] }),
+                jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: `First ${displayTime(finding.first_observed_at)} · Last ${displayTime(finding.last_observed_at)} · ${finding.timeout_count} observed timeouts · Provider retries: not captured` }),
+                jsx('div', { style: { marginTop: 4, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: finding.error_excerpt }),
+                jsxs('div', { style: { marginTop: 6 }, children: [
+                  jsx('strong', { children: 'Example calls' }),
+                  ...finding.examples.map(example => jsx('button', {
+                    type: 'button',
+                    style: { ...buttonStyle, display: 'block', width: '100%', textAlign: 'left', marginTop: 4 },
+                    onClick: () => inspectFindingExample(example),
+                    children: `${displayTime(example.observed_at)} · session ${example.session_id} · call ${example.call_id}`
+                  }, `${example.session_id}-${example.call_id}`))
+                ] })
+              ]
+            }, `${finding.tool_name}-${finding.signature}-${finding.match_basis}`))
+        ]
+      }),
       jsxs('div', {
         style: { display: 'grid', gridTemplateColumns: 'minmax(190px, 0.8fr) minmax(280px, 1.7fr)', gap: 10, minHeight: 280 },
         children: [
@@ -250,9 +313,9 @@ function ControlRoom({ rest }) {
                   jsx('span', { style: mutedStyle, children: outcomeLabel(event.outcome) })
                 ] }),
                 jsx('div', { style: { ...mutedStyle, marginTop: 2 }, children: `${displayTime(event.started_at || event.completed_at)}${event.duration_ms == null ? '' : ` · ${event.duration_ms} ms`}` }),
-                event.error_type || event.error_message ? jsxs('div', {
+                event.error_code || event.error_type || event.error_message ? jsxs('div', {
                   style: { marginTop: 5, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
-                  children: [event.error_type ? `${event.error_type}: ` : '', event.error_message || 'Explicit failure; no message supplied.']
+                  children: [event.error_code ? `${event.error_code}: ` : '', event.error_type ? `${event.error_type}: ` : '', event.error_message || 'Explicit failure; no message supplied.']
                 }) : null,
                 event.capture_state !== 'paired' ? jsx('div', { style: { ...mutedStyle, marginTop: 4 }, children: 'Lifecycle incomplete; outcome coverage is partial.' }) : null,
                 jsx('button', {
@@ -274,10 +337,10 @@ function ControlRoom({ rest }) {
                           ? jsx('div', { style: mutedStyle, children: 'Multiple exact source result records; result unavailable.' })
                           : jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '3px 0' }, children: formatDetailValue(details[event.id].source.result) })
                       ] }),
-                      details[event.id].call.error_type || details[event.id].call.error_message
+                      details[event.id].call.error_code || details[event.id].call.error_type || details[event.id].call.error_message
                         ? jsxs('div', { children: [
                           jsx('strong', { children: 'Captured error' }),
-                          jsx('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: `${details[event.id].call.error_type ? `${details[event.id].call.error_type}: ` : ''}${details[event.id].call.error_message || ''}` })
+                          jsx('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: `${details[event.id].call.error_code ? `${details[event.id].call.error_code}: ` : ''}${details[event.id].call.error_type ? `${details[event.id].call.error_type}: ` : ''}${details[event.id].call.error_message || ''}` })
                         ] }) : null,
                       jsxs('div', { children: [
                         jsx('strong', { children: 'Nearby visible conversation' }),
