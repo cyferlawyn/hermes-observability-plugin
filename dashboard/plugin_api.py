@@ -6,7 +6,8 @@ import importlib.util
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -37,17 +38,22 @@ def _core() -> tuple[Any, Any, Any]:
     return store, service, runtime
 
 
-def _unavailable() -> dict[str, Any]:
+def _unavailable(window: str = "Overall") -> dict[str, Any]:
     return {
         "available": False,
         "reason": "No readable session database is available for this connected profile.",
+        "window": window,
         "metrics": {
+            "window": window,
+            "reset_cutoff": None,
             "calls": {"total": 0, "ok": 0, "failed": 0, "not_executed": 0, "unknown": 0},
             "rate_calls": {"ok": 0, "failed": 0, "denominator": 0},
             "success_rate": None,
             "total_sessions": 0,
+            "included_sessions": 0,
             "captured_sessions": 0,
             "observed_sessions": 0,
+            "rate_included_sessions": 0,
             "partial_sessions": 0,
             "unknown_sessions": 0,
             "excluded_sessions": 0,
@@ -57,15 +63,31 @@ def _unavailable() -> dict[str, Any]:
     }
 
 
+def _validate_timezone(timezone: str | None) -> None:
+    if not timezone:
+        return
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="timezone must be a valid IANA timezone.") from exc
+
+
 @router.get("/overview")
-def overview(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+def overview(
+    limit: int = Query(100, ge=1, le=500),
+    window: Literal["Overall", "Today", "Since Reset"] = Query("Overall"),
+    timezone: str | None = Query(None, max_length=128),
+) -> dict[str, Any]:
     """Control room overview for the profile selected by the Desktop host."""
+    _validate_timezone(timezone)
     store, service, runtime = _core()
     try:
         with runtime.profile_connection() as conn:
             if conn is None:
-                return _unavailable()
-            return service.overview(conn, session_limit=limit)
+                return _unavailable(window)
+            return service.overview(
+                conn, session_limit=limit, window=window, timezone_name=timezone
+            )
     except store.UnsupportedSchemaVersion:
         raise HTTPException(
             status_code=503,
@@ -76,17 +98,42 @@ def overview(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
 
 
 @router.get("/sessions/{session_id}/trace")
-def session_trace(session_id: str) -> dict[str, Any]:
+def session_trace(
+    session_id: str,
+    window: Literal["Overall", "Today", "Since Reset"] = Query("Overall"),
+    timezone: str | None = Query(None, max_length=128),
+) -> dict[str, Any]:
     """Read one session header and its captured operational event metadata."""
+    _validate_timezone(timezone)
     store, service, runtime = _core()
     try:
         with runtime.profile_connection() as conn:
             if conn is None:
                 raise HTTPException(status_code=503, detail="No session database is available.")
-            result = service.session_trace(conn, session_id)
+            result = service.session_trace(
+                conn, session_id, window=window, timezone_name=timezone
+            )
             if result is None:
                 raise HTTPException(status_code=404, detail="Session not found.")
             return result
+    except store.UnsupportedSchemaVersion:
+        raise HTTPException(
+            status_code=503,
+            detail="Observability data uses a newer schema; this plugin will not interpret it.",
+        )
+    except sqlite3.Error:
+        raise HTTPException(status_code=503, detail="The connected profile's session database is unavailable.")
+
+
+@router.post("/reset")
+def reset_metrics() -> dict[str, float]:
+    """Advance the profile-local Since Reset cutoff without deleting any data."""
+    store, _, runtime = _core()
+    try:
+        with runtime.profile_connection() as conn:
+            if conn is None:
+                raise HTTPException(status_code=503, detail="No session database is available.")
+            return {"reset_cutoff": store.reset_metrics(conn)}
     except store.UnsupportedSchemaVersion:
         raise HTTPException(
             status_code=503,

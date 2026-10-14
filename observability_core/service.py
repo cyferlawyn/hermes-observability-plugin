@@ -7,23 +7,43 @@ from typing import Any
 from . import source_detail, store
 
 
-def overview(conn: sqlite3.Connection, *, session_limit: int = 100) -> dict[str, Any]:
+def overview(
+    conn: sqlite3.Connection,
+    *,
+    session_limit: int = 100,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> dict[str, Any]:
     """Return the Control room summary without reading message or provider payloads."""
     return {
         "available": True,
+        "window": window,
         "observer_schema_version": store.OBSERVER_SCHEMA_VERSION,
         "telemetry_schema_version": store.SCHEMA_VERSION,
-        "metrics": store.metrics(conn),
-        "sessions": store.list_sessions(conn, limit=session_limit),
+        "metrics": store.metrics(conn, window=window, now=now, timezone_name=timezone_name),
+        "sessions": store.list_sessions(
+            conn, limit=session_limit, window=window, now=now, timezone_name=timezone_name
+        ),
     }
 
 
-def session_trace(conn: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
+def session_trace(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> dict[str, Any] | None:
     """Return one source-session header and its captured observer metadata."""
-    session = next((item for item in store.list_sessions(conn, limit=500) if item["id"] == session_id), None)
+    session = next((item for item in store.list_sessions(
+        conn, limit=500, window=window, now=now, timezone_name=timezone_name
+    ) if item["id"] == session_id), None)
     if session is None:
         return None
     return {
+        "window": window,
         "session": session,
         "calls": store.session_trace(conn, session_id),
     }
