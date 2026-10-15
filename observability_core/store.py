@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import repeated_failures
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 _META_TABLE = "hermes_observability_meta"
 _SESSIONS_TABLE = "hermes_observability_sessions"
@@ -23,6 +23,7 @@ _CALLS_TABLE = "hermes_observability_calls"
 _PROVIDER_ATTEMPTS_TABLE = "hermes_observability_provider_attempts"
 _FAMILY_COVERAGE_TABLE = "hermes_observability_family_coverage"
 _APPROVALS_TABLE = "hermes_observability_approvals"
+_SUBAGENTS_TABLE = "hermes_observability_subagents"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {_META_TABLE} (
@@ -117,6 +118,30 @@ CREATE TABLE IF NOT EXISTS {_APPROVALS_TABLE} (
 );
 CREATE INDEX IF NOT EXISTS hermes_observability_approvals_session_idx
     ON {_APPROVALS_TABLE}(session_id, requested_at, decided_at, id);
+CREATE TABLE IF NOT EXISTS {_SUBAGENTS_TABLE} (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    parent_session_id TEXT,
+    child_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+    child_session_ref TEXT,
+    parent_turn_id TEXT,
+    parent_subagent_id TEXT,
+    child_subagent_id TEXT,
+    child_role TEXT,
+    child_goal TEXT,
+    started_at REAL,
+    stopped_at REAL,
+    duration_ms REAL,
+    status TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (status IN ('succeeded', 'failed', 'interrupted', 'unknown')),
+    child_summary TEXT,
+    observer_schema_version TEXT NOT NULL,
+    capture_state TEXT NOT NULL CHECK (capture_state IN ('paired', 'start_only', 'stop_only'))
+);
+CREATE INDEX IF NOT EXISTS hermes_observability_subagents_parent_idx
+    ON {_SUBAGENTS_TABLE}(session_id, started_at, id);
+CREATE INDEX IF NOT EXISTS hermes_observability_subagents_child_idx
+    ON {_SUBAGENTS_TABLE}(child_session_id, started_at, id);
 """
 
 
@@ -219,6 +244,363 @@ def register_approval_family(
     )
     conn.commit()
     return True
+
+
+def register_subagent_family(
+    conn: sqlite3.Connection, session_id: str, observer_schema_version: str
+) -> bool:
+    """Record subagent-family support independently from tools and other events."""
+    if conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone() is None:
+        return False
+    version = str(observer_schema_version or "unknown")
+    support = "supported" if version == OBSERVER_SCHEMA_VERSION else "unknown"
+    conn.execute(
+        f"INSERT INTO {_FAMILY_COVERAGE_TABLE} "
+        "(session_id, event_family, observer_schema_version, support_state) "
+        "VALUES (?, 'subagent', ?, ?) ON CONFLICT(session_id, event_family) DO UPDATE SET "
+        "observer_schema_version = CASE WHEN observer_schema_version = excluded.observer_schema_version "
+        "THEN observer_schema_version ELSE 'unknown' END, "
+        "support_state = CASE WHEN observer_schema_version = excluded.observer_schema_version "
+        "THEN support_state ELSE 'unknown' END",
+        (session_id, version, support),
+    )
+    conn.commit()
+    return True
+
+
+def _subagent_status(value: Any) -> str:
+    status = value.strip().lower() if isinstance(value, str) else ""
+    if status in {"success", "succeeded", "completed", "complete"}:
+        return "succeeded"
+    if status in {"error", "failed", "failure"}:
+        return "failed"
+    if status in {"interrupted", "cancelled", "canceled", "timeout", "timed_out", "timed-out"}:
+        return "interrupted"
+    return "unknown"
+
+
+def _subagent_identity(value: Any) -> str | None:
+    """Treat empty or whitespace-only lifecycle identifiers as unavailable."""
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = str(value)
+    return text if text.strip() else None
+
+
+def _subagent_text(value: Any, limit: int = 256) -> str | None:
+    """Persist only bounded observer strings, not arbitrary object representations."""
+    return value[:limit] if isinstance(value, str) and value else None
+
+
+def _subagent_match_sql(alias: str, *, child_session_id: Any, child_subagent_id: Any,
+                        parent_turn_id: Any) -> tuple[str | None, tuple[str, ...]]:
+    child_session = _subagent_identity(child_session_id)
+    child_subagent = _subagent_identity(child_subagent_id)
+    turn_id = _subagent_identity(parent_turn_id)
+    if child_session is not None:
+        return f"COALESCE({alias}.child_session_id, {alias}.child_session_ref) = ?", (child_session,)
+    if child_subagent is not None:
+        predicate = f"{alias}.child_subagent_id = ?"
+        values: tuple[str, ...] = (child_subagent,)
+        if turn_id is not None:
+            predicate += f" AND {alias}.parent_turn_id = ?"
+            values += (turn_id,)
+        return predicate, values
+    return None, ()
+
+
+def begin_subagent(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    parent_session_id: Any = None,
+    child_session_id: Any = None,
+    parent_turn_id: Any = None,
+    parent_subagent_id: Any = None,
+    child_subagent_id: Any = None,
+    child_role: Any = None,
+    child_goal: Any = None,
+    started_at: Any = None,
+    observer_schema_version: str = OBSERVER_SCHEMA_VERSION,
+) -> str | None:
+    """Persist a metadata-only subagent start; never accept child transcript content."""
+    if conn.execute(f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)).fetchone() is None:
+        return None
+    child_ref = _subagent_identity(child_session_id)
+    child_fk = None
+    if child_ref is not None and conn.execute(
+        "SELECT 1 FROM sessions WHERE id = ?", (child_ref,)
+    ).fetchone() is not None:
+        child_fk = child_ref
+    started = _optional_float(started_at)
+    if started is None:
+        started = time.time()
+    event_id = uuid.uuid4().hex
+    conn.execute(
+        f"INSERT INTO {_SUBAGENTS_TABLE} "
+        "(id, session_id, parent_session_id, child_session_id, child_session_ref, parent_turn_id, "
+        "parent_subagent_id, child_subagent_id, child_role, child_goal, started_at, status, "
+        "observer_schema_version, capture_state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, 'start_only')",
+        (event_id, session_id, _subagent_identity(parent_session_id), child_fk, child_ref,
+         _subagent_identity(parent_turn_id), _subagent_identity(parent_subagent_id),
+         _subagent_identity(child_subagent_id), _subagent_text(child_role), _subagent_text(child_goal, 4000),
+         started, str(observer_schema_version or "unknown")),
+    )
+    conn.commit()
+    return event_id
+
+
+def _subagent_completion_values(event: dict[str, Any], started_at: Any) -> tuple[Any, ...]:
+    stopped = _optional_float(event.get("stopped_at"))
+    if stopped is None:
+        stopped = time.time()
+    duration = _optional_float(event.get("duration_ms"))
+    if duration is None and started_at is not None:
+        duration = max(0.0, (stopped - float(started_at)) * 1000)
+    return (
+        stopped, duration, _subagent_status(event.get("child_status")),
+        _subagent_text(event.get("child_role")), _subagent_text(event.get("child_summary"), 4000),
+        str(event.get("telemetry_schema_version") or "unknown"),
+    )
+
+
+def complete_subagent(
+    conn: sqlite3.Connection,
+    event_id: str,
+    event: dict[str, Any],
+) -> bool:
+    """Attach one stop callback to a unique exact child lifecycle start."""
+    row = conn.execute(
+        f"SELECT started_at FROM {_SUBAGENTS_TABLE} WHERE id = ? AND capture_state = 'start_only'",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    values = _subagent_completion_values(event, row["started_at"])
+    cursor = conn.execute(
+        f"UPDATE {_SUBAGENTS_TABLE} SET stopped_at = ?, duration_ms = ?, status = ?, "
+        "child_role = COALESCE(?, child_role), child_summary = ?, observer_schema_version = ?, "
+        "capture_state = 'paired' WHERE id = ? AND capture_state = 'start_only'",
+        (*values, event_id),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def complete_matching_subagent(
+    conn: sqlite3.Connection,
+    session_id: str,
+    event: dict[str, Any],
+) -> bool:
+    """Pair only a single durable start with a safe supplied child identity."""
+    predicate, values = _subagent_match_sql(
+        "subagent", child_session_id=event.get("child_session_id"),
+        child_subagent_id=event.get("child_subagent_id"), parent_turn_id=event.get("parent_turn_id"),
+    )
+    if predicate is None:
+        return False
+    rows = conn.execute(
+        f"SELECT id, started_at, capture_state, parent_turn_id, child_subagent_id "
+        f"FROM {_SUBAGENTS_TABLE} AS subagent "
+        "WHERE session_id = ? AND (" + predicate + ") ORDER BY id LIMIT 2",
+        (session_id, *values),
+    ).fetchall()
+    if len(rows) != 1 or rows[0]["capture_state"] != "start_only":
+        return False
+    candidate = rows[0]
+    for key in ("parent_turn_id", "child_subagent_id"):
+        supplied = _subagent_identity(event.get(key))
+        stored = _subagent_identity(candidate[key])
+        if supplied is not None and stored is not None and supplied != stored:
+            return False
+    return complete_subagent(conn, str(candidate["id"]), event)
+
+
+def record_unmatched_subagent_stop(
+    conn: sqlite3.Connection,
+    session_id: str,
+    event: dict[str, Any],
+    *,
+    parent_session_id: Any = None,
+) -> str | None:
+    """Keep a stop callback without a safely matched start as explicit partial evidence."""
+    if conn.execute(f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)).fetchone() is None:
+        return None
+    stopped, duration, status, role, summary, version = _subagent_completion_values(event, None)
+    child_ref = _subagent_identity(event.get("child_session_id"))
+    child_fk = None
+    if child_ref is not None and conn.execute(
+        "SELECT 1 FROM sessions WHERE id = ?", (child_ref,)
+    ).fetchone() is not None:
+        child_fk = child_ref
+    event_id = uuid.uuid4().hex
+    conn.execute(
+        f"INSERT INTO {_SUBAGENTS_TABLE} "
+        "(id, session_id, parent_session_id, child_session_id, child_session_ref, parent_turn_id, "
+        "parent_subagent_id, child_subagent_id, child_role, stopped_at, duration_ms, status, "
+        "child_summary, observer_schema_version, capture_state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stop_only')",
+        (event_id, session_id, _subagent_identity(parent_session_id), child_fk, child_ref,
+         _subagent_identity(event.get("parent_turn_id")), _subagent_identity(event.get("parent_subagent_id")),
+         _subagent_identity(event.get("child_subagent_id")), role, stopped, duration, status,
+         summary, version),
+    )
+    conn.commit()
+    return event_id
+
+
+def link_subagent_child_session(conn: sqlite3.Connection, session_id: str) -> None:
+    """Attach previously observed child references once their source row exists."""
+    if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
+        return
+    conn.execute(
+        f"UPDATE {_SUBAGENTS_TABLE} SET child_session_id = ? "
+        "WHERE child_session_id IS NULL AND child_session_ref = ?",
+        (session_id, session_id),
+    )
+    conn.commit()
+
+
+def session_subagents(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    """Return related subagent lifecycle metadata without reading or copying child messages."""
+    rows = conn.execute(
+        f"SELECT id, session_id, parent_session_id, COALESCE(child_session_id, child_session_ref) "
+        f"AS child_session_id, parent_turn_id, parent_subagent_id, child_subagent_id, child_role, "
+        f"child_goal, started_at, stopped_at, duration_ms, status, child_summary, "
+        f"observer_schema_version, capture_state, "
+        "EXISTS (SELECT 1 FROM sessions child_source WHERE child_source.id = "
+        "COALESCE(subagent.child_session_id, subagent.child_session_ref)) AS child_session_available, "
+        "EXISTS (SELECT 1 FROM sessions parent_source WHERE parent_source.id = "
+        "subagent.parent_session_id) AS parent_session_available "
+        f"FROM {_SUBAGENTS_TABLE} AS subagent "
+        "WHERE session_id = ? OR child_session_id = ? OR child_session_ref = ? "
+        "ORDER BY COALESCE(started_at, stopped_at), id",
+        (session_id, session_id, session_id),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["relationship"] = "parent" if item["session_id"] == session_id else "child"
+        result.append(item)
+    return result
+
+
+def subagent_session_coverage(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+    """Report subagent support and lifecycle gaps independently from tool coverage."""
+    captured = conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    family = conn.execute(
+        f"SELECT observer_schema_version, support_state FROM {_FAMILY_COVERAGE_TABLE} "
+        "WHERE session_id = ? AND event_family = 'subagent'", (session_id,)
+    ).fetchone()
+    rows = conn.execute(
+        f"SELECT parent_session_id, child_session_id, child_session_ref, child_subagent_id, status, capture_state "
+        f"FROM {_SUBAGENTS_TABLE} WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
+    base = {
+        "event_count": len(rows),
+        "unmatched_starts": sum(row["capture_state"] == "start_only" for row in rows),
+        "unmatched_stops": sum(row["capture_state"] == "stop_only" for row in rows),
+        "unknown_status_events": sum(row["status"] == "unknown" for row in rows),
+        "identity_gaps": sum(
+            row["parent_session_id"] is None or not any(
+                row[key] for key in ("child_session_id", "child_session_ref", "child_subagent_id")
+            ) for row in rows
+        ),
+    }
+    if not captured:
+        return {**base, "support_state": "unknown", "coverage_state": "not_captured", "observer_schema_version": None}
+    if not family:
+        return {**base, "support_state": "unknown", "coverage_state": "unknown", "observer_schema_version": None}
+    version, support = str(family["observer_schema_version"]), str(family["support_state"])
+    if support != "supported" or version != OBSERVER_SCHEMA_VERSION:
+        coverage = "unknown"
+    else:
+        coverage = "partial" if (
+            base["unmatched_starts"] or base["unmatched_stops"] or
+            base["identity_gaps"] or base["unknown_status_events"]
+        ) else "observed_no_known_gaps"
+    return {**base, "support_state": support, "coverage_state": coverage, "observer_schema_version": version}
+
+
+def subagent_metrics(
+    conn: sqlite3.Connection,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate subagent starts/stops only for sessions with compatible family support."""
+    current = float(now if now is not None else time.time())
+    predicate, params = _session_window(window, current, _reset_cutoff(conn), timezone_name=timezone_name)
+    total_sessions = int(conn.execute(f"SELECT COUNT(*) FROM sessions s WHERE {predicate}", params).fetchone()[0])
+    captured_sessions = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_SESSIONS_TABLE} o JOIN sessions s ON s.id = o.session_id WHERE {predicate}", params
+    ).fetchone()[0])
+    family_from = (
+        f"FROM {_FAMILY_COVERAGE_TABLE} f JOIN sessions s ON s.id = f.session_id "
+        f"WHERE {predicate} AND f.event_family = 'subagent'"
+    )
+    supported_filter = "AND f.support_state = 'supported' AND f.observer_schema_version = ?"
+    supported_params = (*params, OBSERVER_SCHEMA_VERSION)
+    supported = int(conn.execute(f"SELECT COUNT(*) {family_from} {supported_filter}", supported_params).fetchone()[0])
+    unsupported = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} AND f.support_state = 'unsupported'", params
+    ).fetchone()[0])
+    observed_predicate = (
+        f"NOT EXISTS (SELECT 1 FROM {_SUBAGENTS_TABLE} a WHERE a.session_id = f.session_id "
+        "AND (a.capture_state != 'paired' OR a.status = 'unknown' OR a.parent_session_id IS NULL OR "
+        "(a.child_session_id IS NULL AND COALESCE(a.child_session_ref, '') = '' "
+        "AND COALESCE(a.child_subagent_id, '') = '')))"
+    )
+    observed = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} {supported_filter} AND {observed_predicate}", supported_params
+    ).fetchone()[0])
+    partial = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} {supported_filter} AND NOT ({observed_predicate})", supported_params
+    ).fetchone()[0])
+    identity_gaps = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_SUBAGENTS_TABLE} a "
+        f"JOIN {_FAMILY_COVERAGE_TABLE} f ON f.session_id = a.session_id "
+        f"JOIN sessions s ON s.id = a.session_id WHERE {predicate} AND f.event_family = 'subagent' "
+        "AND f.support_state = 'supported' AND f.observer_schema_version = ? "
+        "AND (a.parent_session_id IS NULL OR (a.child_session_id IS NULL "
+        "AND COALESCE(a.child_session_ref, '') = '' AND COALESCE(a.child_subagent_id, '') = ''))",
+        supported_params,
+    ).fetchone()[0])
+    events = {"total": 0, "succeeded": 0, "failed": 0, "interrupted": 0, "unknown": 0}
+    rows = conn.execute(
+        f"SELECT a.status, a.capture_state, COUNT(*) AS n FROM {_SUBAGENTS_TABLE} a "
+        f"JOIN {_FAMILY_COVERAGE_TABLE} f ON f.session_id = a.session_id "
+        f"JOIN sessions s ON s.id = a.session_id WHERE {predicate} AND f.event_family = 'subagent' "
+        "AND f.support_state = 'supported' AND f.observer_schema_version = ? GROUP BY a.status, a.capture_state",
+        supported_params,
+    )
+    unmatched_starts = unmatched_stops = 0
+    for row in rows:
+        count = int(row["n"])
+        events["total"] += count
+        if row["status"] in events:
+            events[row["status"]] += count
+        if row["capture_state"] == "start_only":
+            unmatched_starts += count
+        elif row["capture_state"] == "stop_only":
+            unmatched_stops += count
+    unknown_sessions = max(0, captured_sessions - supported - unsupported)
+    return {
+        "window": window, "events": events, "unmatched_starts": unmatched_starts,
+        "unmatched_stops": unmatched_stops, "identity_gaps": identity_gaps,
+        "total_sessions": total_sessions,
+        "captured_sessions": captured_sessions, "supported_sessions": supported,
+        "observed_sessions": observed, "partial_sessions": partial,
+        "unknown_sessions": unknown_sessions, "unsupported_sessions": unsupported,
+        "not_captured_sessions": max(0, total_sessions - captured_sessions),
+    }
 
 
 def _approval_outcome(choice: Any) -> str:
