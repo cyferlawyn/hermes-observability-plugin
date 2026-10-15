@@ -32,6 +32,16 @@ const EMPTY_PROVIDER_ATTEMPTS = {
   rate_excluded_sessions: 0,
   rate_attempts: { ok: 0, failed: 0, denominator: 0 }
 }
+const EMPTY_APPROVALS = {
+  events: { requests: 0, allowed: 0, denied: 0, timed_out: 0, cancelled: 0, unknown: 0 },
+  unpaired_responses: 0,
+  supported_sessions: 0,
+  observed_sessions: 0,
+  partial_sessions: 0,
+  unknown_sessions: 0,
+  unsupported_sessions: 0,
+  not_captured_sessions: 0
+}
 
 const rootStyle = {
   display: 'flex', flexDirection: 'column', gap: 12, padding: 16,
@@ -85,6 +95,26 @@ function providerCoverageLabel(coverage) {
 
 function providerOutcomeLabel(outcome) {
   return ({ ok: 'Response received', failed: 'Request failed', unknown: 'Outcome unknown' })[outcome] || 'Outcome unknown'
+}
+
+function approvalOutcomeLabel(outcome, captureState) {
+  if (captureState === 'request_only') return 'Request · no observed decision'
+  if (captureState === 'response_only') return 'Decision · request unmatched'
+  return ({
+    allowed: 'Allowed', denied: 'Denied', timed_out: 'Timed out',
+    cancelled: 'Cancelled', unknown: 'Unknown'
+  })[outcome] || 'Unknown'
+}
+
+function approvalCoverageLabel(coverage) {
+  if (!coverage) return 'Unknown approval coverage'
+  const support = coverage.support_state || 'unknown'
+  const state = coverage.coverage_state || 'unknown'
+  const stateText = ({
+    observed_no_known_gaps: 'Observed — no known gaps',
+    partial: 'Partial', unknown: 'Unknown', not_captured: 'Not captured'
+  })[state] || 'Unknown'
+  return `${support} · ${stateText}`
 }
 
 function matchBasisLabel(basis) {
@@ -196,6 +226,10 @@ function ControlRoom({ rest }) {
   const sessions = Array.isArray(overview?.sessions) ? overview.sessions : []
   const metrics = overview?.metrics || EMPTY_METRICS
   const providerMetrics = overview?.provider_attempts || EMPTY_PROVIDER_ATTEMPTS
+  const approvalMetrics = overview?.approvals || EMPTY_APPROVALS
+  const approvalCounts = approvalMetrics.events || EMPTY_APPROVALS.events
+  const approvalCoverage = trace?.approval_coverage
+  const approvalEvents = Array.isArray(trace?.approvals) ? trace.approvals : []
   const providerCounts = providerMetrics.attempts || EMPTY_PROVIDER_ATTEMPTS.attempts
   const providerRate = providerMetrics.success_rate === null || providerMetrics.success_rate === undefined
     ? '—' : `${(providerMetrics.success_rate * 100).toFixed(1)}%`
@@ -287,6 +321,37 @@ function ControlRoom({ rest }) {
           jsx('div', { style: { ...mutedStyle, marginTop: 5 }, children: providerCounts.total === 0 && providerMetrics.supported_sessions === 0
             ? 'No compatible provider API observer coverage is available in this window; zero attempts cannot be inferred.'
             : `Coverage is provider-family and schema-specific. Eligible sessions with no known lifecycle gaps may contribute a true zero; partial, unknown, and uncaptured sessions are excluded from the API success rate. Schema: ${overview?.observer_schema_version || 'unknown'}.` })
+        ]
+      }),
+      jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsxs('div', { children: [
+            jsx('h2', { style: { fontSize: 13, margin: '0 0 3px' }, children: 'Approval lifecycle' }),
+            jsx('div', { style: mutedStyle, children: 'Observer-reported approval requests and decisions are a separate event family. Approval outcomes do not classify tool execution or change call success-rate math; command text is not retained.' })
+          ] }),
+          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }, children: [
+            jsx(Metric, {
+              label: 'Approval requests observed',
+              value: approvalMetrics.supported_sessions > 0 ? `≥${approvalCounts.requests}` : '—',
+              detail: approvalMetrics.supported_sessions > 0
+                ? `${approvalCounts.allowed} allowed · ${approvalCounts.denied} denied · ${approvalCounts.timed_out} timed out · ${approvalCounts.cancelled} cancelled · ${approvalCounts.unknown} unknown`
+                : 'No compatible approval-family support; zero requests cannot be inferred.'
+            }),
+            jsx(Metric, {
+              label: 'Unmatched decisions',
+              value: approvalMetrics.supported_sessions > 0 ? approvalMetrics.unpaired_responses : '—',
+              detail: 'Visible decisions without a safely matched request; excluded from request totals.'
+            }),
+            jsx(Metric, {
+              label: 'Approval coverage',
+              value: `${approvalMetrics.observed_sessions || 0} observed`,
+              detail: `${approvalMetrics.supported_sessions || 0} supported · ${approvalMetrics.partial_sessions || 0} partial · ${approvalMetrics.unknown_sessions || 0} unknown · ${approvalMetrics.unsupported_sessions || 0} unsupported · ${approvalMetrics.not_captured_sessions || 0} not captured`
+            })
+          ] }),
+          jsx('div', { style: { ...mutedStyle, marginTop: 5 }, children: approvalMetrics.supported_sessions > 0
+            ? 'Counts include only sessions with compatible approval observer support; events from unknown or unsupported schema sessions are excluded and cannot be interpreted as zero. Incomplete and unmatched lifecycles remain visible.'
+            : 'No compatible approval observer coverage is available in this window; do not interpret missing events as zero.' })
         ]
       }),
       jsxs('section', {
@@ -446,6 +511,47 @@ function ControlRoom({ rest }) {
                   ? jsx('div', { style: { ...mutedStyle, marginTop: 4 }, children: event.capture_state === 'post_only'
                     ? 'Unpaired API callback; excluded from attempt totals because no safe lifecycle match was available.'
                     : 'API attempt has no observed completion; provider coverage is partial.' }) : null
+              ]
+            }, event.id))
+        ]
+      }),
+      jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8 }, children: [
+            jsx('h2', { style: { fontSize: 13, margin: 0 }, children: 'Approval trace' }),
+            jsx('span', { style: mutedStyle, children: approvalCoverageLabel(approvalCoverage) })
+          ] }),
+          jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: approvalCoverage?.observer_schema_version
+            ? `Observer schema ${approvalCoverage.observer_schema_version} · ${approvalCoverage.request_count} requests · ${approvalCoverage.unpaired_response_count} unmatched decisions. Command text is not retained.`
+            : 'Approval-family support or coverage is unknown for this session.' }),
+          approvalEvents.length === 0
+            ? jsx('div', { style: { ...mutedStyle, marginTop: 8 }, children: approvalCoverage?.coverage_state === 'observed_no_known_gaps'
+              ? 'No approval events observed in this session.'
+              : 'No approval events captured; absence cannot be inferred from this coverage state.' })
+            : approvalEvents.map(event => jsxs('article', {
+              style: { borderTop: '1px solid var(--ui-stroke-secondary)', padding: '8px 0', marginTop: 7 },
+              children: [
+                jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8 }, children: [
+                  jsx('strong', { children: approvalOutcomeLabel(event.outcome, event.capture_state) }),
+                  jsx('span', { style: mutedStyle, children: event.choice || 'Choice unknown' })
+                ] }),
+                jsx('div', { style: { ...mutedStyle, marginTop: 2, overflowWrap: 'anywhere' }, children: `${event.surface || 'Surface unknown'} · ${displayTime(event.requested_at || event.decided_at)}${event.duration_ms == null ? '' : ` · ${Number(event.duration_ms).toFixed(0)} ms`}` }),
+                event.tool_call_id || event.turn_id
+                  ? jsx('div', { style: { marginTop: 4, overflowWrap: 'anywhere' }, children: [
+                    event.tool_call_id ? `tool call ${event.tool_call_id}` : '',
+                    event.turn_id ? `turn ${event.turn_id}` : ''
+                  ].filter(Boolean).join(' · ') }) : null,
+                event.decided_by ? jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: `Decision source ${event.decided_by}` }) : null,
+                event.related_call_status === 'matched'
+                  ? jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: `Related invocation ${event.related_call_id}` })
+                  : event.related_call_status === 'ambiguous'
+                    ? jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: 'Related invocation ID is ambiguous; no call was selected.' })
+                    : null,
+                event.capture_state !== 'paired'
+                  ? jsx('div', { style: { ...mutedStyle, marginTop: 4 }, children: event.capture_state === 'response_only'
+                    ? 'Unmatched approval decision; shown as evidence but not counted as a confirmed request.'
+                    : 'Approval request has no observed decision; approval-family coverage is partial.' }) : null
               ]
             }, event.id))
         ]

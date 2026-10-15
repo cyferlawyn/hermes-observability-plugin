@@ -38,7 +38,7 @@ class StoreMigrationTests(unittest.TestCase):
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(hermes_observability_calls)")}
         self.assertIn("error_code", columns)
         self.assertIn("failure_status", columns)
-        self.assertEqual(conn.execute("SELECT value FROM hermes_observability_meta WHERE key = 'schema_version'").fetchone()[0], "3")
+        self.assertEqual(conn.execute("SELECT value FROM hermes_observability_meta WHERE key = 'schema_version'").fetchone()[0], "4")
         self.assertEqual(conn.execute("SELECT error_message FROM hermes_observability_calls WHERE id = 'call1'").fetchone()[0], "disk error")
         conn.close()
     def test_schema_v2_creates_provider_family_tables_without_changing_call_rows(self):
@@ -65,9 +65,10 @@ class StoreMigrationTests(unittest.TestCase):
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         self.assertIn("hermes_observability_provider_attempts", tables)
         self.assertIn("hermes_observability_family_coverage", tables)
+        self.assertIn("hermes_observability_approvals", tables)
         self.assertEqual(
             conn.execute("SELECT value FROM hermes_observability_meta WHERE key = 'schema_version'").fetchone()[0],
-            "3",
+            "4",
         )
         conn.close()
 

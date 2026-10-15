@@ -25,6 +25,9 @@ def overview(
         "provider_attempts": store.provider_metrics(
             conn, window=window, now=now, timezone_name=timezone_name
         ),
+        "approvals": store.approval_metrics(
+            conn, window=window, now=now, timezone_name=timezone_name
+        ),
         "sessions": store.list_sessions(
             conn, limit=session_limit, window=window, now=now, timezone_name=timezone_name
         ),
@@ -54,6 +57,8 @@ def session_trace(
         "calls": store.session_trace(conn, session_id),
         "provider_attempts": store.session_provider_attempts(conn, session_id),
         "provider_coverage": store.provider_session_coverage(conn, session_id),
+        "approvals": store.session_approvals(conn, session_id),
+        "approval_coverage": store.approval_session_coverage(conn, session_id),
     }
 
 

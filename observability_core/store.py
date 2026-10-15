@@ -15,13 +15,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import repeated_failures
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
 _META_TABLE = "hermes_observability_meta"
 _SESSIONS_TABLE = "hermes_observability_sessions"
 _CALLS_TABLE = "hermes_observability_calls"
 _PROVIDER_ATTEMPTS_TABLE = "hermes_observability_provider_attempts"
 _FAMILY_COVERAGE_TABLE = "hermes_observability_family_coverage"
+_APPROVALS_TABLE = "hermes_observability_approvals"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {_META_TABLE} (
@@ -95,6 +96,27 @@ CREATE INDEX IF NOT EXISTS hermes_observability_provider_session_idx
     ON {_PROVIDER_ATTEMPTS_TABLE}(session_id, started_at, id);
 CREATE INDEX IF NOT EXISTS hermes_observability_provider_turn_idx
     ON {_PROVIDER_ATTEMPTS_TABLE}(session_id, turn_id, api_call_count);
+CREATE TABLE IF NOT EXISTS {_APPROVALS_TABLE} (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    session_key TEXT,
+    turn_id TEXT,
+    tool_call_id TEXT,
+    surface TEXT,
+    pattern_key TEXT,
+    pattern_keys TEXT NOT NULL DEFAULT '[]',
+    requested_at REAL,
+    decided_at REAL,
+    duration_ms REAL,
+    outcome TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (outcome IN ('allowed', 'denied', 'timed_out', 'cancelled', 'unknown')),
+    choice TEXT,
+    decided_by TEXT,
+    observer_schema_version TEXT NOT NULL,
+    capture_state TEXT NOT NULL CHECK (capture_state IN ('paired', 'request_only', 'response_only'))
+);
+CREATE INDEX IF NOT EXISTS hermes_observability_approvals_session_idx
+    ON {_APPROVALS_TABLE}(session_id, requested_at, decided_at, id);
 """
 
 
@@ -173,6 +195,222 @@ def register_provider_family(
     )
     conn.commit()
     return True
+
+
+def register_approval_family(
+    conn: sqlite3.Connection, session_id: str, observer_schema_version: str
+) -> bool:
+    """Record approval observer support independently from tool-call coverage."""
+    if conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone() is None:
+        return False
+    version = str(observer_schema_version or "unknown")
+    support = "supported" if version == OBSERVER_SCHEMA_VERSION else "unknown"
+    conn.execute(
+        f"INSERT INTO {_FAMILY_COVERAGE_TABLE} "
+        "(session_id, event_family, observer_schema_version, support_state) "
+        "VALUES (?, 'approval', ?, ?) ON CONFLICT(session_id, event_family) DO UPDATE SET "
+        "observer_schema_version = CASE WHEN observer_schema_version = excluded.observer_schema_version "
+        "THEN observer_schema_version ELSE 'unknown' END, "
+        "support_state = CASE WHEN observer_schema_version = excluded.observer_schema_version "
+        "THEN support_state ELSE 'unknown' END",
+        (session_id, version, support),
+    )
+    conn.commit()
+    return True
+
+
+def _approval_outcome(choice: Any) -> str:
+    value = _approval_choice(choice)
+    if value in {"once", "session", "always", "smart_approve"}:
+        return "allowed"
+    if value in {"deny", "smart_deny"}:
+        return "denied"
+    if value in {"timeout", "timed_out", "timed-out"}:
+        return "timed_out"
+    if value in {"cancelled", "canceled"}:
+        return "cancelled"
+    return "unknown"
+
+
+def _approval_choice(value: Any) -> str:
+    text = value if isinstance(value, str) else None
+    choice = text.strip().lower() if text else ""
+    allowed = {
+        "once", "session", "always", "deny", "timeout", "timed_out", "timed-out",
+        "cancelled", "canceled", "smart_approve", "smart_deny", "notify_failed",
+    }
+    return choice if choice in allowed else "unknown"
+
+
+def _approval_decider(value: Any) -> str | None:
+    text = value if isinstance(value, str) else None
+    return "aux_llm" if text and text.strip().lower() == "aux_llm" else None
+
+
+def approval_surface(value: Any) -> str:
+    """Collapse observer surfaces to a small allowlisted vocabulary."""
+    text = value if isinstance(value, str) else ""
+    if text in {"cli", "gateway", "smart", "vault-payment"}:
+        return text
+    if text.startswith("mcp-elicitation/"):
+        return "mcp-elicitation"
+    if text.startswith("mcp-trust/"):
+        return "mcp-trust"
+    return "unknown"
+
+
+def _approval_pattern_keys(_value: Any) -> str:
+    """Pattern labels may be descriptions; deliberately do not persist them or fingerprints."""
+    return "[]"
+
+
+def begin_approval_request(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    session_key: Any = None,
+    turn_id: Any = None,
+    tool_call_id: Any = None,
+    surface: Any = None,
+    pattern_key: Any = None,
+    pattern_keys: Any = None,
+    requested_at: float | None = None,
+    observer_schema_version: str = OBSERVER_SCHEMA_VERSION,
+) -> str | None:
+    """Record an approval request without retaining command or descriptive text."""
+    if conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone() is None:
+        return None
+    event_id = uuid.uuid4().hex
+    conn.execute(
+        f"INSERT INTO {_APPROVALS_TABLE} "
+        "(id, session_id, session_key, turn_id, tool_call_id, surface, pattern_key, pattern_keys, "
+        "requested_at, outcome, observer_schema_version, capture_state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, 'request_only')",
+        (event_id, session_id, _identity_text(session_key), _identity_text(turn_id),
+         _identity_text(tool_call_id), approval_surface(surface), None,
+         _approval_pattern_keys(pattern_keys), float(requested_at if requested_at is not None else time.time()),
+         str(observer_schema_version or "unknown")),
+    )
+    conn.commit()
+    return event_id
+
+
+def approval_key_seen(conn: sqlite3.Connection, key: tuple[str, ...]) -> bool:
+    """Check durable approval evidence before reusing an opaque correlation key."""
+    if len(key) != 4:
+        return False
+    session_id, surface, turn_id, tool_call_id = key
+    return conn.execute(
+        f"SELECT 1 FROM {_APPROVALS_TABLE} WHERE session_id = ? "
+        "AND COALESCE(surface, '') = ? AND COALESCE(turn_id, '') = ? "
+        "AND COALESCE(tool_call_id, '') = ? LIMIT 1",
+        (session_id, surface, turn_id, tool_call_id),
+    ).fetchone() is not None
+
+
+def complete_approval_request(
+    conn: sqlite3.Connection,
+    event_id: str,
+    *,
+    choice: Any,
+    decided_by: Any = None,
+    decided_at: float | None = None,
+    observer_schema_version: str = OBSERVER_SCHEMA_VERSION,
+) -> bool:
+    """Attach an explicit approval decision to exactly one observed request."""
+    decision_time = float(decided_at if decided_at is not None else time.time())
+    row = conn.execute(
+        f"SELECT requested_at FROM {_APPROVALS_TABLE} WHERE id = ? AND capture_state = 'request_only'",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    requested_at = row["requested_at"]
+    duration = max(0.0, (decision_time - float(requested_at)) * 1000) if requested_at is not None else None
+    cursor = conn.execute(
+        f"UPDATE {_APPROVALS_TABLE} SET decided_at = ?, duration_ms = ?, outcome = ?, choice = ?, "
+        "decided_by = ?, observer_schema_version = ?, capture_state = 'paired' "
+        "WHERE id = ? AND capture_state = 'request_only'",
+        (decision_time, duration, _approval_outcome(choice), _approval_choice(choice),
+         _approval_decider(decided_by), str(observer_schema_version or "unknown"), event_id),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def record_post_only_approval(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    session_key: Any = None,
+    turn_id: Any = None,
+    tool_call_id: Any = None,
+    surface: Any = None,
+    pattern_key: Any = None,
+    pattern_keys: Any = None,
+    choice: Any = None,
+    decided_by: Any = None,
+    decided_at: float | None = None,
+    observer_schema_version: str = OBSERVER_SCHEMA_VERSION,
+) -> str | None:
+    """Retain a decision without a safe matching request as partial evidence."""
+    if conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone() is None:
+        return None
+    event_id = uuid.uuid4().hex
+    conn.execute(
+        f"INSERT INTO {_APPROVALS_TABLE} "
+        "(id, session_id, session_key, turn_id, tool_call_id, surface, pattern_key, pattern_keys, "
+        "decided_at, outcome, choice, decided_by, observer_schema_version, capture_state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'response_only')",
+        (event_id, session_id, _identity_text(session_key), _identity_text(turn_id),
+         _identity_text(tool_call_id), approval_surface(surface), None,
+         _approval_pattern_keys(pattern_keys), float(decided_at if decided_at is not None else time.time()),
+         _approval_outcome(choice), _approval_choice(choice), _approval_decider(decided_by),
+         str(observer_schema_version or "unknown")),
+    )
+    conn.commit()
+    return event_id
+
+
+def session_approvals(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    """Return bounded approval lifecycle metadata; sensitive command text is never stored."""
+    rows = conn.execute(
+        f"SELECT id, session_id, session_key, turn_id, tool_call_id, surface, pattern_key, pattern_keys, "
+        "requested_at, decided_at, duration_ms, outcome, choice, decided_by, observer_schema_version, capture_state "
+        f"FROM {_APPROVALS_TABLE} WHERE session_id = ? "
+        "ORDER BY COALESCE(requested_at, decided_at), id",
+        (session_id,),
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["pattern_keys"] = json.loads(item["pattern_keys"])
+        except (TypeError, json.JSONDecodeError):
+            item["pattern_keys"] = []
+        item["related_call_id"] = None
+        item["related_call_status"] = "unavailable"
+        if item["tool_call_id"]:
+            related = conn.execute(
+                f"SELECT id FROM {_CALLS_TABLE} WHERE session_id = ? AND tool_call_id = ? "
+                "AND (? IS NULL OR turn_id = ?) LIMIT 2",
+                (session_id, item["tool_call_id"], item["turn_id"], item["turn_id"]),
+            ).fetchall()
+            if len(related) == 1:
+                item["related_call_id"] = str(related[0]["id"])
+                item["related_call_status"] = "matched"
+            elif related:
+                item["related_call_status"] = "ambiguous"
+            else:
+                item["related_call_status"] = "not_found"
+        result.append(item)
+    return result
 
 
 def _safe_text(value: Any, limit: int = 256) -> str | None:
@@ -346,6 +584,132 @@ def session_provider_attempts(conn: sqlite3.Connection, session_id: str) -> list
             item["usage"] = {}
         result.append(item)
     return result
+
+
+def approval_session_coverage(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+    """Describe approval-family support and lifecycle gaps separately from tool calls."""
+    captured = conn.execute(
+        f"SELECT 1 FROM {_SESSIONS_TABLE} WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    family = conn.execute(
+        f"SELECT observer_schema_version, support_state FROM {_FAMILY_COVERAGE_TABLE} "
+        "WHERE session_id = ? AND event_family = 'approval'",
+        (session_id,),
+    ).fetchone()
+    request_count = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_APPROVALS_TABLE} WHERE session_id = ? AND capture_state != 'response_only'",
+        (session_id,),
+    ).fetchone()[0])
+    unpaired_response_count = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_APPROVALS_TABLE} WHERE session_id = ? AND capture_state = 'response_only'",
+        (session_id,),
+    ).fetchone()[0])
+    base = {"request_count": request_count, "unpaired_response_count": unpaired_response_count}
+    if not captured:
+        return {
+            **base, "support_state": "unknown", "coverage_state": "not_captured",
+            "observer_schema_version": None,
+        }
+    if not family:
+        return {
+            **base, "support_state": "unknown", "coverage_state": "unknown",
+            "observer_schema_version": None,
+        }
+    version = str(family["observer_schema_version"])
+    support = str(family["support_state"])
+    if support != "supported" or version != OBSERVER_SCHEMA_VERSION:
+        coverage = "unknown"
+    else:
+        gap = conn.execute(
+            f"SELECT 1 FROM {_APPROVALS_TABLE} WHERE session_id = ? "
+            "AND (capture_state != 'paired' OR outcome = 'unknown') LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        coverage = "partial" if gap else "observed_no_known_gaps"
+    return {
+        **base, "support_state": support, "coverage_state": coverage,
+        "observer_schema_version": version,
+    }
+
+
+def approval_metrics(
+    conn: sqlite3.Connection,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate explicit approval evidence with its own support and gap counts."""
+    current = float(now if now is not None else time.time())
+    predicate, params = _session_window(
+        window, current, _reset_cutoff(conn), timezone_name=timezone_name
+    )
+    total_sessions = int(conn.execute(
+        f"SELECT COUNT(*) FROM sessions s WHERE {predicate}", params
+    ).fetchone()[0])
+    captured_sessions = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_SESSIONS_TABLE} o JOIN sessions s ON s.id = o.session_id "
+        f"WHERE {predicate}", params
+    ).fetchone()[0])
+    family_from = (
+        f"FROM {_FAMILY_COVERAGE_TABLE} f JOIN sessions s ON s.id = f.session_id "
+        f"WHERE {predicate} AND f.event_family = 'approval'"
+    )
+    family_params = (*params, OBSERVER_SCHEMA_VERSION)
+    supported_filter = "AND f.support_state = 'supported' AND f.observer_schema_version = ?"
+    supported = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} {supported_filter}", family_params
+    ).fetchone()[0])
+    unsupported = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} AND f.support_state = 'unsupported'", params
+    ).fetchone()[0])
+    unknown = max(0, captured_sessions - supported - unsupported)
+    gap_predicate = (
+        f"NOT EXISTS (SELECT 1 FROM {_APPROVALS_TABLE} a "
+        "WHERE a.session_id = f.session_id AND (a.capture_state != 'paired' OR a.outcome = 'unknown'))"
+    )
+    observed = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} {supported_filter} AND {gap_predicate}", family_params
+    ).fetchone()[0])
+    partial = int(conn.execute(
+        f"SELECT COUNT(*) {family_from} {supported_filter} AND NOT ({gap_predicate})", family_params
+    ).fetchone()[0])
+    events = {"requests": 0, "allowed": 0, "denied": 0, "timed_out": 0, "cancelled": 0, "unknown": 0}
+    for row in conn.execute(
+        f"SELECT a.outcome, COUNT(*) AS n FROM {_APPROVALS_TABLE} a "
+        f"JOIN {_FAMILY_COVERAGE_TABLE} f ON f.session_id = a.session_id "
+        f"JOIN sessions s ON s.id = a.session_id WHERE {predicate} "
+        "AND f.event_family = 'approval' AND f.support_state = 'supported' "
+        "AND f.observer_schema_version = ? AND a.capture_state != 'response_only' "
+        "GROUP BY a.outcome",
+        (*params, OBSERVER_SCHEMA_VERSION),
+    ):
+        outcome = str(row["outcome"])
+        count = int(row["n"])
+        events["requests"] += count
+        if outcome in events:
+            events[outcome] += count
+    unpaired_responses = int(conn.execute(
+        f"SELECT COUNT(*) FROM {_APPROVALS_TABLE} a "
+        f"JOIN {_FAMILY_COVERAGE_TABLE} f ON f.session_id = a.session_id "
+        f"JOIN sessions s ON s.id = a.session_id WHERE {predicate} "
+        "AND f.event_family = 'approval' AND f.support_state = 'supported' "
+        "AND f.observer_schema_version = ? AND a.capture_state = 'response_only'",
+        (*params, OBSERVER_SCHEMA_VERSION),
+    ).fetchone()[0])
+    return {
+        "window": window,
+        "events": events,
+        "unpaired_responses": unpaired_responses,
+        "total_sessions": total_sessions,
+        "captured_sessions": captured_sessions,
+        "supported_sessions": supported,
+        "observed_sessions": observed,
+        "partial_sessions": partial,
+        "unknown_sessions": unknown,
+        "unsupported_sessions": unsupported,
+        "not_captured_sessions": max(0, total_sessions - captured_sessions),
+    }
 
 
 def provider_session_coverage(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
