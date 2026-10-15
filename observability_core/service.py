@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from . import source_detail, store
+from . import analyze_prompt, source_detail, store
 
 
 def overview(
@@ -78,9 +78,11 @@ def call_detail(
         conn, session_id, call["tool_name"], call["tool_call_id"]
     )
     context = source.pop("context", [])
-    return {
+    detail = {
         "available": source["status"] == "matched",
         "call": call,
         "source": source,
         "context": context,
     }
+    detail["analyze_prompt"] = analyze_prompt.build_analyze_prompt(detail)
+    return detail

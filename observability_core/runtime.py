@@ -15,12 +15,24 @@ _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY: set[tuple[str, int]] = set()
 
 
+def profile_home() -> Path:
+    """Return the active profile home using Hermes' request/session routing context."""
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home())
+
+
+def profile_name() -> str | None:
+    """Return the canonical active profile ID, or None when the home cannot be mapped safely."""
+    from hermes_constants import profile_name_for_home
+
+    return profile_name_for_home(profile_home())
+
+
 @contextmanager
 def profile_connection() -> Iterator[sqlite3.Connection | None]:
     """Open the connected profile's existing state.db without creating a new database."""
-    from hermes_constants import get_hermes_home
-
-    db_path = Path(get_hermes_home()) / "state.db"
+    db_path = profile_home() / "state.db"
     if not db_path.is_file():
         yield None
         return

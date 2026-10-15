@@ -1,5 +1,5 @@
-import { host, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { host, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA, useValue } from '@hermes/plugin-sdk'
+import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hermes-observability-plugin'
@@ -163,6 +163,92 @@ function formatDetailValue(value) {
   return JSON.stringify(value, null, 2)
 }
 
+function subscribeProfileChanges() {
+  const profileAtom = host.state.profile
+  const initialProfile = profileAtom.get()
+  let changed = false
+  const unsubscribe = profileAtom.subscribe(profile => {
+    if (profile !== initialProfile) changed = true
+  })
+  return {
+    profile: initialProfile,
+    changed: () => changed || profileAtom.get() !== initialProfile,
+    dispose: unsubscribe
+  }
+}
+
+async function readCallDetail(rest, event) {
+  const watch = subscribeProfileChanges()
+  const profile = watch.profile
+  try {
+    if (typeof profile !== 'string' || !profile) {
+      throw new Error('The connected profile cannot be verified; call detail was not loaded.')
+    }
+    const detail = await rest(
+      `/sessions/${encodeURIComponent(event.session_id)}/calls/${encodeURIComponent(event.id)}/detail?profile=${encodeURIComponent(profile)}`
+    )
+    if (watch.changed()) {
+      throw new Error('The connected profile changed while reading call detail; result discarded.')
+    }
+    if (detail?.profile !== profile) {
+      throw new Error('Call detail profile could not be verified.')
+    }
+    return detail
+  } finally {
+    watch.dispose()
+  }
+}
+
+async function startAnalyzeFollowUp(prompt, rest, sourceProfile) {
+  const watch = subscribeProfileChanges()
+  const profile = sourceProfile
+  try {
+    if (typeof profile !== 'string' || !profile) {
+      throw new Error('The failed call is not bound to a verifiable connected profile; no Analyze session was created.')
+    }
+    if (watch.profile !== profile || watch.changed()) {
+      throw new Error('The selected call belongs to a different profile; no Analyze session was created.')
+    }
+    if (typeof rest !== 'function') {
+      throw new Error('Could not enforce the read-only Analyze session policy; no prompt was submitted.')
+    }
+
+    const created = await host.request('session.create', { source: 'desktop', profile })
+    if (watch.changed()) {
+      throw new Error('The connected profile changed before the Analyze session was protected; no prompt was submitted.')
+    }
+    const sessionId = created?.session_id
+    const storedSessionId = created?.stored_session_id
+    if (!sessionId || !storedSessionId) {
+      throw new Error('Hermes did not return both runtime and stored IDs for the follow-up session.')
+    }
+
+    const policy = await rest(
+      `/analyze-sessions/${encodeURIComponent(sessionId)}/read-only?profile=${encodeURIComponent(profile)}`,
+      { method: 'POST' }
+    )
+    if (watch.changed()) {
+      throw new Error('The connected profile changed during policy installation; no prompt was submitted.')
+    }
+    if (policy?.read_only !== true || policy?.profile !== profile) {
+      throw new Error('The read-only policy was installed in a different profile or could not be verified; no prompt was submitted.')
+    }
+
+    await host.request('prompt.submit', { session_id: sessionId, text: prompt, profile })
+    if (watch.changed()) {
+      return { storedSessionId, opened: false, profileChanged: true }
+    }
+    try {
+      await host.openSession(storedSessionId, { profile, intent: 'tab' })
+      return { storedSessionId, opened: true }
+    } catch {
+      return { storedSessionId, opened: false }
+    }
+  } finally {
+    watch.dispose()
+  }
+}
+
 function Metric({ label, value, detail }) {
   return jsxs('div', {
     style: { ...cardStyle, flex: '1 1 130px' },
@@ -174,7 +260,29 @@ function Metric({ label, value, detail }) {
   })
 }
 
+function AnalyzeAction({ event, detail, activeProfile, analyzingCallId, analyzeStatus, onAnalyze }) {
+  if (event.outcome !== 'failed' || !detail?.analyze_prompt || detail.profile !== activeProfile) return null
+  return jsxs('section', {
+    style: { borderTop: '1px solid var(--ui-stroke-secondary)', paddingTop: 8, display: 'grid', gap: 6 },
+    children: [
+      jsx('strong', { children: 'Analyze this failed call' }),
+      jsx('div', { style: mutedStyle, children: 'Only clicking Analyze creates a fresh session on this connected profile. It contains the selected tool identity, outcome/timing, captured error, exact source arguments/result when available, nearby visible conversation, and source references. Missing evidence is labeled unavailable; provider reasoning, raw provider payloads, and child transcripts are excluded. The source session and telemetry are not changed. All tool calls in the follow-up are blocked by a durable policy hook.' }),
+      jsx('div', { style: mutedStyle, children: 'The analysis session is enforced read-only. Any remediation must be carried out in a separate normal session after explicit approval.' }),
+      jsx('button', {
+        type: 'button', style: buttonStyle,
+        disabled: Boolean(analyzingCallId),
+        onClick: onAnalyze,
+        children: analyzingCallId === event.id ? 'Starting Analyze session…' : 'Analyze'
+      }),
+      analyzeStatus.callId === event.id && analyzeStatus.message
+        ? jsx('div', { role: 'status', style: mutedStyle, children: analyzeStatus.message }) : null
+    ]
+  })
+}
+
 function ControlRoom({ rest }) {
+  const connectedProfile = useValue(host.state.profile)
+  const previousProfile = useRef(connectedProfile)
   const [overview, setOverview] = useState(null)
   const [selectedId, setSelectedId] = useState('')
   const [trace, setTrace] = useState(null)
@@ -185,18 +293,68 @@ function ControlRoom({ rest }) {
   const [resetting, setResetting] = useState(false)
   const [details, setDetails] = useState({})
   const [detailLoading, setDetailLoading] = useState('')
+  const [analyzingCallId, setAnalyzingCallId] = useState('')
+  const [analyzeStatus, setAnalyzeStatus] = useState({ callId: '', message: '' })
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+
+  useEffect(() => {
+    if (previousProfile.current === connectedProfile) return
+    previousProfile.current = connectedProfile
+    setOverview(null)
+    setSelectedId('')
+    setTrace(null)
+    setDetails({})
+    setDetailLoading('')
+    setAnalyzingCallId('')
+    setAnalyzeStatus({ callId: '', message: '' })
+    setError('')
+    setRefreshKey(value => value + 1)
+  }, [connectedProfile])
 
   async function inspectCall(event) {
     setDetailLoading(event.id)
     setDetails(value => ({ ...value, [event.id]: null }))
     try {
-      const detail = await rest(`/sessions/${encodeURIComponent(event.session_id)}/calls/${encodeURIComponent(event.id)}/detail`)
+      const detail = await readCallDetail(rest, event)
       setDetails(value => ({ ...value, [event.id]: detail }))
     } catch (err) {
-      setDetails(value => ({ ...value, [event.id]: { error: err?.message || 'Could not read source detail.' } }))
+      if (host.state.profile.get() === connectedProfile) {
+        setDetails(value => ({ ...value, [event.id]: { profile: connectedProfile, error: err?.message || 'Could not read source detail.' } }))
+      }
     } finally {
       setDetailLoading('')
+    }
+  }
+
+  async function analyzeCall(event, detail) {
+    if (analyzingCallId || event.outcome !== 'failed' || !detail?.analyze_prompt) return
+    if (!detail.profile || detail.profile !== host.state.profile.get()) {
+      setAnalyzeStatus({ callId: event.id, message: 'The selected call belongs to a different or unverified profile; no session was created.' })
+      return
+    }
+    setAnalyzingCallId(event.id)
+    setAnalyzeStatus({ callId: event.id, message: '' })
+    try {
+      const result = await startAnalyzeFollowUp(detail.analyze_prompt, rest, detail.profile)
+      if (result.profileChanged) {
+        if (host.state.profile.get() === detail.profile) {
+          setAnalyzeStatus({
+            callId: event.id,
+            message: `The prompt was submitted to the original profile, but the profile changed during submission; the follow-up was not opened. Session: ${result.storedSessionId}`
+          })
+        }
+        return
+      }
+      setAnalyzeStatus({
+        callId: event.id,
+        message: result.opened
+          ? `Analyze follow-up started in a separate session (${result.storedSessionId}).`
+          : `Analyze follow-up started, but the Desktop could not open it. Session: ${result.storedSessionId}`
+      })
+    } catch (err) {
+      setAnalyzeStatus({ callId: event.id, message: err?.message || 'Could not start the Analyze follow-up.' })
+    } finally {
+      setAnalyzingCallId('')
     }
   }
 
@@ -282,6 +440,9 @@ function ControlRoom({ rest }) {
     || (trace?.session?.id === selectedId ? trace.session : null)
   const selectedNotInOverview = Boolean(selected && !sessions.some(session => session.id === selectedId))
   const events = Array.isArray(trace?.calls) ? trace.calls : []
+  const visibleDetails = Object.fromEntries(
+    Object.entries(details).filter(([, detail]) => detail?.profile === connectedProfile)
+  )
   const findings = Array.isArray(overview?.repeated_failures) ? overview.repeated_failures : []
   const findingsCoverageIncomplete = Number(metrics.rate_excluded_sessions || 0) > 0
 
@@ -513,36 +674,54 @@ function ControlRoom({ rest }) {
                   onClick: () => inspectCall(event),
                   children: detailLoading === event.id ? 'Loading source detail…' : 'Inspect source detail'
                 }),
-                details[event.id] ? (details[event.id].error
-                  ? jsx('div', { role: 'alert', style: { marginTop: 7 }, children: details[event.id].error })
-                  : details[event.id].available
+                visibleDetails[event.id] ? (visibleDetails[event.id].error
+                  ? jsx('div', { role: 'alert', style: { marginTop: 7 }, children: visibleDetails[event.id].error })
+                  : visibleDetails[event.id].available
                     ? jsxs('div', { style: { marginTop: 8, display: 'grid', gap: 7 }, children: [
                       jsxs('div', { children: [
                         jsx('strong', { children: 'Arguments' }),
-                        jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '3px 0' }, children: formatDetailValue(details[event.id].source.arguments) })
+                        jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '3px 0' }, children: formatDetailValue(visibleDetails[event.id].source.arguments) })
                       ] }),
                       jsxs('div', { children: [
                         jsx('strong', { children: 'Source result' }),
-                        details[event.id].source.result_status === 'ambiguous'
+                        visibleDetails[event.id].source.result_status === 'ambiguous'
                           ? jsx('div', { style: mutedStyle, children: 'Multiple exact source result records; result unavailable.' })
-                          : jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '3px 0' }, children: formatDetailValue(details[event.id].source.result) })
+                          : jsx('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '3px 0' }, children: formatDetailValue(visibleDetails[event.id].source.result) })
                       ] }),
-                      details[event.id].call.error_code || details[event.id].call.error_type || details[event.id].call.error_message
+                      visibleDetails[event.id].call.error_code || visibleDetails[event.id].call.error_type || visibleDetails[event.id].call.error_message
                         ? jsxs('div', { children: [
                           jsx('strong', { children: 'Captured error' }),
-                          jsx('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: `${details[event.id].call.error_code ? `${details[event.id].call.error_code}: ` : ''}${details[event.id].call.error_type ? `${details[event.id].call.error_type}: ` : ''}${details[event.id].call.error_message || ''}` })
+                          jsx('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: `${visibleDetails[event.id].call.error_code ? `${visibleDetails[event.id].call.error_code}: ` : ''}${visibleDetails[event.id].call.error_type ? `${visibleDetails[event.id].call.error_type}: ` : ''}${visibleDetails[event.id].call.error_message || ''}` })
                         ] }) : null,
                       jsxs('div', { children: [
                         jsx('strong', { children: 'Nearby visible conversation' }),
-                        ...details[event.id].context.map((item, index) => jsxs('div', {
+                        ...visibleDetails[event.id].context.map((item, index) => jsxs('div', {
                           style: { borderLeft: '2px solid var(--ui-stroke-secondary)', paddingLeft: 7, marginTop: 4, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
                           children: [jsx('span', { style: mutedStyle, children: `${item.role}: ` }), item.content]
                         }, `${index}-${item.role}`))
-                      ] })
+                      ] }),
+                      jsx(AnalyzeAction, {
+                        event,
+                        detail: visibleDetails[event.id],
+                        activeProfile: connectedProfile,
+                        analyzingCallId,
+                        analyzeStatus,
+                        onAnalyze: () => analyzeCall(event, visibleDetails[event.id])
+                      })
                     ] })
-                    : jsx('div', { style: { ...mutedStyle, marginTop: 7 }, children: details[event.id].source.status === 'ambiguous'
-                      ? 'Source record correlation is ambiguous; no source content was selected.'
-                      : 'No exact source session/tool-call match. Source context is unavailable; no fuzzy match was attempted.' })) : null
+                    : jsxs('div', { style: { ...mutedStyle, marginTop: 7 }, children: [
+                      jsx('div', { children: visibleDetails[event.id].source.status === 'ambiguous'
+                        ? 'Source record correlation is ambiguous; no source content was selected.'
+                        : 'No exact source session/tool-call match. Source context is unavailable; no fuzzy match was attempted.' }),
+                      jsx(AnalyzeAction, {
+                        event,
+                        detail: visibleDetails[event.id],
+                        activeProfile: connectedProfile,
+                        analyzingCallId,
+                        analyzeStatus,
+                        onAnalyze: () => analyzeCall(event, visibleDetails[event.id])
+                      })
+                    ] }) ) : null
               ]
             }, event.id))
           ] })
