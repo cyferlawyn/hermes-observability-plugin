@@ -1388,6 +1388,91 @@ def session_trace(conn: sqlite3.Connection, session_id: str) -> list[dict[str, A
     return [dict(row) for row in rows]
 
 
+def tool_breakdown(
+    conn: sqlite3.Connection,
+    *,
+    window: str = "Overall",
+    now: float | None = None,
+    timezone_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Aggregate exact tool identities with per-tool compatible coverage."""
+    current = float(now if now is not None else time.time())
+    predicate, params = _session_window(
+        window, current, _reset_cutoff(conn), timezone_name=timezone_name
+    )
+    sessions = conn.execute(
+        f"SELECT s.id, o.observer_schema_version FROM sessions s "
+        f"LEFT JOIN {_SESSIONS_TABLE} o ON o.session_id = s.id WHERE {predicate}",
+        params,
+    ).fetchall()
+    total_sessions = len(sessions)
+    captured_sessions = {
+        str(row["id"]): row["observer_schema_version"] for row in sessions
+        if row["observer_schema_version"] is not None
+    }
+    call_rows = conn.execute(
+        f"SELECT c.session_id, c.tool_name, c.outcome, c.capture_state FROM {_CALLS_TABLE} c "
+        f"JOIN sessions s ON s.id = c.session_id WHERE {predicate} ORDER BY c.tool_name",
+        params,
+    ).fetchall()
+    compatible_ids = {
+        session_id for session_id, version in captured_sessions.items()
+        if version == OBSERVER_SCHEMA_VERSION
+    }
+    unknown_sessions = len(captured_sessions) - len(compatible_ids)
+    not_captured_sessions = total_sessions - len(captured_sessions)
+    identity_gap_sessions: set[str] = set()
+    by_tool: dict[str, dict[str, Any]] = {}
+    for row in call_rows:
+        tool_name = str(row["tool_name"])
+        session_id = str(row["session_id"])
+        if not tool_name or tool_name == "unknown":
+            identity_gap_sessions.add(session_id)
+            continue
+        item = by_tool.setdefault(tool_name, {
+            "calls": {"total": 0, "ok": 0, "failed": 0, "not_executed": 0, "unknown": 0},
+            "rows": [],
+            "gap_sessions": set(),
+        })
+        item["rows"].append(row)
+        outcome = str(row["outcome"])
+        if outcome in item["calls"]:
+            item["calls"][outcome] += 1
+            item["calls"]["total"] += 1
+        if (session_id in compatible_ids
+                and (row["capture_state"] != "paired" or outcome == "unknown")):
+            item["gap_sessions"].add(session_id)
+
+    results: list[dict[str, Any]] = []
+    for tool_name, item in by_tool.items():
+        gap_sessions = item["gap_sessions"] | (identity_gap_sessions & compatible_ids)
+        observed_sessions = len(compatible_ids) - len(gap_sessions)
+        rate_calls = {"ok": 0, "failed": 0, "denominator": 0}
+        for row in item["rows"]:
+            if (str(row["session_id"]) in compatible_ids
+                    and str(row["session_id"]) not in gap_sessions
+                    and row["outcome"] in ("ok", "failed")):
+                rate_calls[str(row["outcome"])] += 1
+        rate_calls["denominator"] = rate_calls["ok"] + rate_calls["failed"]
+        results.append({
+            "tool_name": tool_name,
+            "calls": item["calls"],
+            "rate_calls": rate_calls,
+            "success_rate": (
+                rate_calls["ok"] / rate_calls["denominator"]
+                if rate_calls["denominator"] else None
+            ),
+            "coverage": {
+                "total_sessions": total_sessions,
+                "observed_sessions": observed_sessions,
+                "partial_sessions": len(gap_sessions),
+                "unknown_sessions": unknown_sessions,
+                "not_captured_sessions": not_captured_sessions,
+            },
+        })
+    return sorted(results, key=lambda item: (-item["calls"]["total"], item["tool_name"]))
+
+
 def call_record(conn: sqlite3.Connection, session_id: str, call_id: str) -> dict[str, Any] | None:
     """Return one captured call's metadata, scoped to its exact source session."""
     row = conn.execute(

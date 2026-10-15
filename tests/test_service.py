@@ -64,6 +64,10 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(finding["tool_name"], "mcp__browser__search")
         self.assertEqual(finding["affected_sessions"], 2)
         self.assertEqual({item["session_id"] for item in finding["examples"]}, {"captured", "captured-2"})
+        self.assertEqual(
+            [item["tool_name"] for item in result["tool_breakdown"]],
+            ["mcp__browser__search"],
+        )
         self.assertNotIn("captured", [row["id"] for row in result["sessions"]])
         old_example_trace = service.session_trace(self.conn, "captured")
         self.assertEqual(old_example_trace["session"]["id"], "captured")
@@ -87,6 +91,106 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("request", result)
         self.assertNotIn("response", result)
         self.assertNotIn("args", result["calls"][0])
+
+    def test_trace_timeline_interleaves_visible_turns_with_tool_calls(self):
+        self.conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, content TEXT, timestamp REAL, tool_calls TEXT, reasoning TEXT)"
+        )
+        self.conn.executemany(
+            "INSERT INTO messages (id, session_id, role, content, timestamp, tool_calls, reasoning) "
+            "VALUES (?, 'captured', ?, ?, ?, ?, ?)",
+            [
+                (1, "user", "Read the file", 119.0, None, "hidden user reasoning"),
+                (2, "assistant", "", 120.0, '[{"id":"source-tool-call"}]', "hidden tool-call reasoning"),
+                (3, "assistant", "I inspected the file.", 122.0, None, "hidden assistant reasoning"),
+            ],
+        )
+        self.conn.commit()
+
+        result = service.session_trace(self.conn, "captured")
+        assert result is not None
+
+        self.assertEqual([item["kind"] for item in result["timeline"]], [
+            "message", "message", "tool_call", "message"
+        ])
+        self.assertEqual([item.get("role") or item.get("tool_name") for item in result["timeline"]], [
+            "user", "assistant", "mcp:browser.search", "assistant"
+        ])
+        self.assertEqual(result["timeline"][0]["content"], "Read the file")
+        self.assertTrue(result["timeline"][1]["has_tool_calls"])
+        self.assertEqual(result["timeline"][1]["content"], "")
+        self.assertNotIn("source-tool-call", str(result["timeline"]))
+        self.assertNotIn("reasoning", str(result["timeline"]))
+
+    def test_trace_timeline_is_available_without_a_messages_table(self):
+        result = service.session_trace(self.conn, "captured")
+        assert result is not None
+
+        self.assertEqual([item["kind"] for item in result["timeline"]], ["tool_call"])
+
+    def test_trace_timeline_merges_provider_attempts_and_keeps_time_order(self):
+        provider_id = store.begin_provider_attempt(
+            self.conn, "captured", provider="openai", model="gpt-test", started_at=119.5
+        )
+        self.assertIsNotNone(provider_id)
+        assert provider_id is not None
+        store.complete_provider_attempt(
+            self.conn, provider_id, {"ended_at": 120.5, "api_duration": 1.0}, outcome="ok"
+        )
+
+        result = service.session_trace(self.conn, "captured")
+        assert result is not None
+
+        self.assertEqual([item["kind"] for item in result["timeline"]], [
+            "provider_attempt", "tool_call"
+        ])
+        self.assertEqual(result["timeline"][0]["provider"], "openai")
+
+    def test_trace_timeline_merges_approval_and_subagent_events(self):
+        approval_id = store.begin_approval_request(
+            self.conn, "captured", surface="gateway", requested_at=121.0
+        )
+        assert approval_id is not None
+        self.assertTrue(store.complete_approval_request(
+            self.conn, approval_id, choice="once", decided_at=121.5
+        ))
+        subagent_id = store.begin_subagent(
+            self.conn, "captured", parent_session_id="captured", child_session_id="child",
+            child_role="researcher", child_goal="Find the cause", started_at=122.0,
+        )
+        assert subagent_id is not None
+        self.assertTrue(store.complete_subagent(
+            self.conn, subagent_id,
+            {"child_status": "success", "stopped_at": 123.0,
+             "telemetry_schema_version": store.OBSERVER_SCHEMA_VERSION},
+        ))
+
+        result = service.session_trace(self.conn, "captured")
+
+        assert result is not None
+        self.assertEqual([item["kind"] for item in result["timeline"]], [
+            "tool_call", "approval", "subagent"
+        ])
+        self.assertEqual(result["timeline"][1]["outcome"], "allowed")
+        self.assertEqual(result["timeline"][2]["child_goal"], "Find the cause")
+
+    def test_uncaptured_session_messages_are_not_backfilled_into_trace(self):
+        self.conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, content TEXT, timestamp REAL)"
+        )
+        self.conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp) "
+            "VALUES (1, 'old', 'user', 'historic visible message', 60.0)"
+        )
+        self.conn.commit()
+
+        result = service.session_trace(self.conn, "old")
+
+        assert result is not None
+        self.assertEqual(result["session"]["coverage_state"], "not_captured")
+        self.assertEqual(result["timeline"], [])
 
     def test_trace_response_is_none_for_unknown_session(self):
         self.assertIsNone(service.session_trace(self.conn, "missing"))

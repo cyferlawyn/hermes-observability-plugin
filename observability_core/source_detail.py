@@ -119,3 +119,39 @@ def _visible_context(conn: sqlite3.Connection, session_id: str, message_id: int)
         {key: row[key] for key in ("role", "content", "timestamp") if key in row.keys()}
         for row in items
     ]
+
+
+def visible_messages(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    """Read visible user/assistant messages for an on-demand session timeline.
+
+    Message text stays in Hermes' canonical store; reasoning and provider-only
+    fields are deliberately not selected or returned.
+    """
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    required = {"id", "session_id", "role", "content"}
+    if not required.issubset(columns):
+        return []
+    timestamp_select = ", timestamp" if "timestamp" in columns else ", NULL AS timestamp"
+    tool_calls_select = (
+        ", CASE WHEN tool_calls IS NOT NULL AND tool_calls != '' THEN 1 ELSE 0 END AS has_tool_calls"
+        if "tool_calls" in columns else ", 0 AS has_tool_calls"
+    )
+    rows = conn.execute(
+        "SELECT id, role, content" + timestamp_select + tool_calls_select + " FROM messages "
+        "WHERE session_id = ? AND role IN ('user', 'assistant') "
+        "AND ((content IS NOT NULL AND content != '') OR has_tool_calls = 1) "
+        "ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    return [
+        {
+            "source_message_id": row["id"],
+            "role": row["role"],
+            "content": row["content"] or "",
+            "timestamp": row["timestamp"],
+            "has_tool_calls": bool(row["has_tool_calls"]),
+        }
+        for row in rows
+    ]
