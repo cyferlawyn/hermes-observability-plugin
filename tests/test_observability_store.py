@@ -127,6 +127,39 @@ class ObservabilityStoreTests(unittest.TestCase):
             "not_captured_sessions": 1,
         })
 
+    def test_list_sessions_exposes_outcome_counts_and_only_eligible_success_rates(self):
+        ok_id = store.begin_tool_call(self.conn, "s1", "files.read", started_at=120.0)
+        assert ok_id is not None
+        store.complete_tool_call(self.conn, ok_id, "ok", completed_at=121.0)
+        failed_id = store.begin_tool_call(self.conn, "s1", "files.read", started_at=122.0)
+        assert failed_id is not None
+        store.complete_tool_call(self.conn, failed_id, "error", completed_at=123.0)
+        blocked_id = store.begin_tool_call(self.conn, "s1", "terminal", started_at=124.0)
+        assert blocked_id is not None
+        store.complete_tool_call(self.conn, blocked_id, "blocked", completed_at=125.0)
+        store.begin_tool_call(self.conn, "s1", "web.search", started_at=126.0)
+
+        store.register_session(self.conn, "s2", captured_at=210.0)
+        paired_ok = store.begin_tool_call(self.conn, "s2", "files.read", started_at=220.0)
+        paired_failed = store.begin_tool_call(self.conn, "s2", "files.read", started_at=222.0)
+        assert paired_ok is not None and paired_failed is not None
+        store.complete_tool_call(self.conn, paired_ok, "ok", completed_at=221.0)
+        store.complete_tool_call(self.conn, paired_failed, "error", completed_at=223.0)
+
+        sessions = {item["id"]: item for item in store.list_sessions(self.conn)}
+
+        self.assertEqual(sessions["s1"]["call_counts"], {
+            "total": 4, "ok": 1, "failed": 1, "not_executed": 1, "unknown": 1
+        })
+        self.assertEqual(sessions["s1"]["call_success_rate"], None)
+        self.assertNotIn("success_rate", sessions["s1"])
+        self.assertEqual(sessions["s1"]["coverage_state"], "partial")
+        self.assertEqual(sessions["s2"]["call_counts"], {
+            "total": 2, "ok": 1, "failed": 1, "not_executed": 0, "unknown": 0
+        })
+        self.assertEqual(sessions["s2"]["call_success_rate"], 0.5)
+        self.assertEqual(sessions["s2"]["coverage_state"], "observed_no_known_gaps")
+
     def test_source_session_deletion_cascades_telemetry(self):
         call_id = store.begin_tool_call(self.conn, "s1", "files.read", started_at=120.0)
         store.complete_tool_call(self.conn, call_id, "ok", completed_at=121.0)

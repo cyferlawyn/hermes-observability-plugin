@@ -80,8 +80,66 @@ def _is_timeout(row: dict[str, Any]) -> bool:
     return status in _TIMEOUT_STATUSES or error_type == "timeout" or error_type.endswith("timeouterror")
 
 
+def _api_retry_key(row: dict[str, Any]) -> tuple[str, str, str] | None:
+    request_id = row.get("api_request_id")
+    if request_id is None or str(request_id) == "":
+        return None
+    return (
+        str(row.get("session_id") or ""),
+        str(row.get("turn_id") or ""),
+        str(request_id),
+    )
+
+
+def _linked_retry_evidence(
+    calls: list[tuple[dict[str, Any], str, str]],
+    attempts_by_key: dict[tuple[str, str, str], list[dict[str, Any]]],
+) -> tuple[int | None, str]:
+    """Join retries only by exact session, turn, and API-request IDs."""
+    expected_keys: set[tuple[str, str, str]] = set()
+    unmatched_call = False
+    for row, _, _ in calls:
+        key = _api_retry_key(row)
+        if key is None:
+            unmatched_call = True
+        else:
+            expected_keys.add(key)
+
+    total_retries = 0
+    matched_keys = 0
+    attempt_evidence = False
+    incomplete_evidence = False
+    for key in expected_keys:
+        attempts = attempts_by_key.get(key, [])
+        if len(attempts) != 1:
+            attempt_evidence = attempt_evidence or bool(attempts)
+            incomplete_evidence = True
+            continue
+        attempt_evidence = True
+        if attempts[0].get("capture_state") != "paired" or attempts[0].get("retry_count") is None:
+            incomplete_evidence = True
+            continue
+        try:
+            retry_count = int(attempts[0]["retry_count"])
+        except (TypeError, ValueError):
+            incomplete_evidence = True
+            continue
+        if retry_count < 0:
+            incomplete_evidence = True
+            continue
+        total_retries += retry_count
+        matched_keys += 1
+
+    if matched_keys == 0:
+        return None, "unknown" if attempt_evidence else "not_captured"
+    if unmatched_call or incomplete_evidence or matched_keys != len(expected_keys):
+        return total_retries, "partial"
+    return total_retries, "observed"
+
+
 def build_findings(
-    rows: Iterable[dict[str, Any]], *, population_excluded_sessions: int = 0
+    rows: Iterable[dict[str, Any]], *, population_excluded_sessions: int = 0,
+    provider_attempts: Iterable[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     """Group by exact observer tool identity and deterministic error signature.
 
@@ -91,6 +149,12 @@ def build_findings(
     """
     groups: dict[tuple[str, Any], list[tuple[dict[str, Any], str, str]]] = defaultdict(list)
     seen_invocations: set[tuple[str, ...]] = set()
+    attempts_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for provider_attempt in provider_attempts:
+        attempt = dict(provider_attempt)
+        key = _api_retry_key(attempt)
+        if key is not None:
+            attempts_by_key[key].append(attempt)
 
     ordered_rows = sorted(
         (dict(row) for row in rows),
@@ -175,6 +239,7 @@ def build_findings(
             }
             for row, call_id in example_calls
         ]
+        retry_count, retry_state = _linked_retry_evidence(calls, attempts_by_key)
         findings.append({
             "tool_name": tool_name,
             "identity_kind": "mcp" if tool_name.startswith("mcp__") else "tool",
@@ -185,10 +250,8 @@ def build_findings(
             "first_observed_at": min(timestamps) if timestamps else None,
             "last_observed_at": max(timestamps) if timestamps else None,
             "timeout_count": sum(1 for row, _, _ in calls if _is_timeout(row)),
-            # API retries are a separate observer event family and are not captured
-            # by this plugin version; never substitute a made-up zero.
-            "retry_count": None,
-            "retry_state": "not_captured",
+            "retry_count": retry_count,
+            "retry_state": retry_state,
             "error_excerpt": error_excerpt,
             "at_least_n_observed": population_excluded_sessions > 0,
             "population_excluded_sessions": max(0, int(population_excluded_sessions)),

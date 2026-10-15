@@ -6,6 +6,18 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import analyze_prompt, source_detail, store
+from .documentation_links import (
+    attach_documentation_links,
+    configured_documentation_links as read_plugin_documentation_links,
+)
+
+
+PLUGIN_ID = "hermes-observability-plugin"
+
+
+def configured_documentation_links(config: Any) -> dict[str, str]:
+    """Return this plugin's exact-identity documentation links from profile config."""
+    return read_plugin_documentation_links(config, PLUGIN_ID)
 
 
 def overview(
@@ -15,9 +27,10 @@ def overview(
     window: str = "Overall",
     now: float | None = None,
     timezone_name: str | None = None,
+    documentation_links: Any = None,
 ) -> dict[str, Any]:
     """Return the Control room summary without reading message or provider payloads."""
-    return {
+    result = {
         "available": True,
         "window": window,
         "observer_schema_version": store.OBSERVER_SCHEMA_VERSION,
@@ -42,6 +55,7 @@ def overview(
             conn, window=window, now=now, timezone_name=timezone_name
         ),
     }
+    return attach_documentation_links(result, documentation_links)
 
 
 def session_trace(

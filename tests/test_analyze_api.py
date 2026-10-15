@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from observability_core import analyze_guard, runtime
+from observability_core import analyze_guard, runtime, service
 
 
 class _Router:
@@ -54,6 +54,24 @@ class AnalyzePolicyApiTests(unittest.TestCase):
 
         with patch.dict(sys.modules, {"hermes_constants": hermes_constants_stub}):
             self.assertEqual(runtime.profile_name(), "personal")
+
+    def test_documentation_links_are_read_from_this_plugin_profile_settings(self):
+        links = {"mcp__server__search": "https://docs.example.invalid/search"}
+        config_module = types.ModuleType("hermes_cli.config")
+        setattr(config_module, "load_config", lambda: {"plugins": {"entries": {
+            "hermes-observability-plugin": {"settings": {"documentation_links": links}},
+            "other-plugin": {"settings": {"documentation_links": {"terminal": "https://docs.example.invalid/other"}}},
+        }}})
+        hermes_cli_module = types.ModuleType("hermes_cli")
+        setattr(hermes_cli_module, "__path__", [])
+
+        with patch.dict(sys.modules, {
+            "hermes_cli": hermes_cli_module,
+            "hermes_cli.config": config_module,
+        }):
+            result = api._configured_documentation_links(service)
+
+        self.assertEqual(result, links)
 
     def test_endpoint_installs_the_real_profile_local_read_only_marker(self):
         with tempfile.TemporaryDirectory() as temp_dir:

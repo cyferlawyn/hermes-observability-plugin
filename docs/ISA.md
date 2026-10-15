@@ -1,6 +1,6 @@
 # Ideal State Artifact: Hermes Agent Observability Dashboard
 
-**Status:** Draft for implementation planning; all decision tickets resolved. No production collector or dashboard has been implemented.
+**Status:** Version 1.0.0 implementation candidate is present in this repository. This ISA remains the acceptance contract; verification evidence and outstanding live-performance validation are recorded in [release evidence](release/1.0.0-evidence.md).
 
 ## 1. Purpose
 
@@ -158,6 +158,8 @@ Keep a failure-first view as a cross-session diagnostic path and a dense Trace l
 
 ## 11. Acceptance criteria
 
+Implementation evidence and measured performance limits for this release are recorded in [docs/release/1.0.0-evidence.md](release/1.0.0-evidence.md). The evidence distinguishes automated checks, synthetic benchmarks, and live/manual integration that still requires a Desktop user.
+
 ### Correctness and coverage
 
 - Controlled fixtures achieve **100% expected event/outcome matches** for the defined supported scenarios: tool/MCP success and explicit failure; blocked/cancelled/not-executed; unknown/incomplete; provider retries; approval responses; subagent start/stop; interrupted sessions; reset; and source-session deletion.
@@ -178,7 +180,7 @@ Keep a failure-first view as a cross-session diagnostic path and a dense Trace l
 
 ## 12. Deferred and out of scope
 
-- Implementing or deploying the collector/dashboard is outside this specification document.
+- Implementing/deploying the collector or dashboard is outside the scope of this specification document; implementation and deployment guidance live in the repository's code and README.
 - Cross-install or cross-profile aggregation, exports, and advanced trend analysis.
 - Automatic LLM-based error classification/recommendations, generated documentation edits, or unattended remediation.
 - Hosted third-party telemetry analytics as a default.
@@ -190,9 +192,9 @@ A user-triggered Analyze session is included; any remediation remains separately
 ## 13. Explicit implementation risks
 
 1. **Hermes database coupling:** Plugin-owned event tables share Hermes' internal `state.db`. Namespacing, independent schema versioning/migrations, SQLite write contention, deletion cascade, and compatibility across supported Hermes upgrades must be validated.
-2. **Fail-open observer hooks:** A collector callback error or abrupt process stop may leave events silently missing or lifecycle pairs unmatched. Surface detected gaps; do not relabel `Observed—no known gaps` as guaranteed complete.
+2. **Fail-open observer hooks and telemetry durability:** A collector callback error or abrupt process stop may leave events silently missing or lifecycle pairs unmatched. Surface detected gaps; do not relabel `Observed—no known gaps` as guaranteed complete. On WAL databases, if `database.synchronous` is unset, the plugin's thread-local connection uses `NORMAL` for plugin-owned telemetry only; explicit Hermes settings are honored. Sudden power loss may lose recent telemetry commits, while Hermes' core session-data connection is unaffected.
 3. **Prospective-only history:** Pre-enable and already-open sessions are not observer-captured. Early cross-session patterns may be sparse; coverage counts must make this visible.
-4. **Performance target:** Numeric latency budgets remain unset pending a representative benchmark; do not claim them before measurement.
+4. **Performance target:** No numeric SLO is set. Synthetic p50/p95 evidence is recorded in the release report, but real model/provider turns and Electron paint still require live validation before making a broader “no noticeable slowdown” claim.
 5. **Analyze context transfer:** The action sends selected failure evidence into a new model session. Keep the prompt narrow, identify the fields included, and preserve the source trace.
 6. **Plugin topology:** Desktop UI and backend must be installed/enabled on the appropriate local and connected remote profile surfaces; the UI must remain profile-routed and must not handle broad server credentials.
 

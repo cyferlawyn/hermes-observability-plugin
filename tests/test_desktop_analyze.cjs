@@ -242,7 +242,7 @@ test('a prompt submission failure never opens or targets the source session', as
   assert.equal(calls[1][1].session_id, 'runtime-new')
 })
 
-test('Control Room presents tool breakdown and a unified, chronological session activity view', () => {
+test('Control Room renders triage, failure queue, and chronological ledger workflows', () => {
   const start = pluginSource.indexOf('const ID =')
   const end = pluginSource.indexOf('\nconst plugin = {', start)
   assert.notEqual(start, -1)
@@ -263,13 +263,22 @@ test('Control Room presents tool breakdown and a unified, chronological session 
       tool_name: 'mcp__files__read',
       calls: { total: 4, ok: 3, failed: 1, not_executed: 0, unknown: 0 },
       rate_calls: { ok: 3, failed: 1, denominator: 4 }, success_rate: 0.75,
-      coverage: { total_sessions: 1, observed_sessions: 1, partial_sessions: 0, unknown_sessions: 0, not_captured_sessions: 0 }
+      coverage: { total_sessions: 1, observed_sessions: 1, partial_sessions: 0, unknown_sessions: 0, not_captured_sessions: 0 },
+      documentation_url: 'https://docs.example.invalid/files-read'
     }],
     sessions: [{
       id: 's1', title: 'Read incident notes', started_at: 200,
-      coverage_state: 'observed_no_known_gaps', call_count: 4
+      coverage_state: 'partial', call_count: 4,
+      call_counts: { total: 4, ok: 2, failed: 1, not_executed: 0, unknown: 1 }, call_success_rate: null
     }],
-    repeated_failures: []
+    repeated_failures: [{
+      tool_name: 'mcp__files__read', identity_kind: 'mcp', signature: 'missing required argument: query',
+      match_basis: 'structured_error_code', distinct_failed_calls: 2, affected_sessions: 2,
+      first_observed_at: 202, last_observed_at: 203, timeout_count: 0, retry_count: null,
+      retry_state: 'not_captured', error_excerpt: 'missing query', at_least_n_observed: false,
+      documentation_url: 'https://docs.example.invalid/files-read',
+      examples: [{ session_id: 's1', call_id: 'c1', observed_at: 203 }]
+    }]
   }
   const trace = {
     session: overview.sessions[0], calls: [], provider_attempts: [], approvals: [], subagents: [],
@@ -282,6 +291,8 @@ test('Control Room presents tool breakdown and a unified, chronological session 
     ]
   }
   let stateIndex = 0
+  let selectedView = 'control'
+  let ledgerFilter = ''
   const host = { state: { profile: { get: () => 'personal', subscribe: () => () => {} } } }
   const jsx = (type, props) => ({ type, props: props || {} })
   const jsxs = jsx
@@ -290,8 +301,13 @@ test('Control Room presents tool breakdown and a unified, chronological session 
     useValue: atom => atom.get(), useRef: value => ({ current: value }), useEffect: () => {},
     useState: initial => {
       const index = stateIndex++
-      const value = index === 0 ? overview : index === 1 ? 's1' : index === 2 ? trace : initial
-      return [value, () => {}]
+      const value = index === 0 ? overview : index === 1 ? 's1' : index === 2 ? trace : index === 14 ? selectedView : index === 15 ? ledgerFilter : initial
+      const setValue = index === 14
+        ? next => { selectedView = typeof next === 'function' ? next(selectedView) : next }
+        : index === 15
+          ? next => { ledgerFilter = typeof next === 'function' ? next(ledgerFilter) : next }
+          : () => {}
+      return [value, setValue]
     }
   }
   const { ControlRoom } = vm.runInNewContext(source, hooks)
@@ -304,10 +320,20 @@ test('Control Room presents tool breakdown and a unified, chronological session 
     renderedNodes.push(node)
     return `${Object.entries(node.props || {}).filter(([key]) => key !== 'children').map(([, value]) => typeof value === 'string' ? value : '').join(' ')} ${render(node.props?.children)}`
   }
-  const text = render(ControlRoom({ rest: async () => ({}) }))
+  const renderCurrentView = () => {
+    stateIndex = 0
+    renderedNodes.length = 0
+    return render(ControlRoom({ rest: async () => ({}) }))
+  }
+  const renderView = view => {
+    selectedView = view
+    return renderCurrentView()
+  }
+  const text = renderView('control')
 
   assert.match(text, /Tool & MCP breakdown/)
   assert.match(text, /mcp__files__read/)
+  assert.match(text, /Documentation ↗/)
   assert.match(text, /Session activity/)
   assert.match(text, /Find the incident cause/)
   assert.match(text, /Provider attempt/)
@@ -323,4 +349,29 @@ test('Control Room presents tool breakdown and a unified, chronological session 
   assert.ok(['info', 'success', 'danger', 'subagent'].every(tone => statusTones.includes(tone)), 'event status chips use distinct semantic colors')
   assert.ok(renderedNodes.some(node => node.props?.['data-metric-tone'] === 'warning'), 'sub-90% success metric is highlighted as cautionary')
   assert.ok(renderedNodes.some(node => node.type === 'section' && String(node.props?.style?.border || '').includes('--dt-border')), 'panels use the stronger prototype-style border')
+  assert.match(text, /Failure queue/)
+  assert.match(text, /Trace ledger/)
+
+  const failureTab = renderedNodes.find(node => node.type === 'button' && node.props?.children === 'Failure queue')
+  assert.ok(failureTab, 'failure queue navigation is rendered')
+  failureTab.props.onClick()
+  const failureText = renderCurrentView()
+  assert.match(failureText, /Cross-session failure queue/)
+  assert.match(failureText, /Sessions with failed or unknown outcomes/)
+  assert.match(failureText, /Read incident notes/)
+  assert.match(failureText, /missing required argument: query/)
+  assert.match(failureText, /No exact provider-attempt link/)
+  assert.match(failureText, /Inspect example/)
+
+  const ledgerTab = renderedNodes.find(node => node.type === 'button' && node.props?.children === 'Trace ledger')
+  assert.ok(ledgerTab, 'trace ledger navigation is rendered')
+  ledgerTab.props.onClick()
+  const ledgerText = renderCurrentView()
+  assert.match(ledgerText, /Trace ledger/)
+  assert.match(ledgerText, /Filter events/)
+  assert.match(ledgerText, /Find the incident cause/)
+  const ledgerFilterInput = renderedNodes.find(node => node.props?.['aria-label'] === 'Filter events')
+  ledgerFilterInput.props.onChange({ target: { value: 'mcp__files__read' } })
+  const filteredLedgerText = renderCurrentView()
+  assert.match(filteredLedgerText, /1 \/ 5 events/)
 })
