@@ -21,7 +21,7 @@ This first implementation slice is deliberately narrower than the ISA first rele
 - Store versioned, plugin-owned metadata tables in the connected profile's existing `state.db`; source-session deletion cascades to plugin rows.
 - Persist only observer identity/correlation fields, timestamps, tool name, explicit outcome, duration, and structured error details. For provider requests, retain only provider/model identity, opaque API-attempt correlation, attempt/retry metadata, timing, allow-listed numeric usage counters, and explicit error metadata. Approval telemetry allowlists surfaces and decisions and retains supplied session/turn/tool-call IDs and timing; approval-pattern labels, command text, and descriptions are never retained. Subagent telemetry retains supplied parent/child IDs, role, bounded goal and summary, status, and duration; never copy child transcripts. Never copy tool arguments/results, sanitized/raw provider payloads, reasoning, or error messages.
 
-Not yet implemented in this slice: the user-triggered Analyze flow. It remains bounded by the ISA and is a later implementation slice, not a rejected feature. Export, cross-install aggregation, automatic analysis, and unattended remediation remain out of scope as specified by the ISA.
+- Failed-call detail includes a user-triggered Analyze action. It sends a bounded, allow-listed evidence prompt to a fresh session on the exact profile recorded with the detail; profile mismatches and stale details abort before submission. Source references and unavailable evidence are labeled. No provider reasoning, raw provider payloads, or child transcripts are included. A durable, profile-local marker under `.hermes-observability/analyze-read-only` (SHA-256 session-ID filename; no evidence stored) enables a `pre_tool_call` policy that blocks every tool in the follow-up session, including when session identity is unavailable, and fails closed on policy errors. Remediation must happen in a separate normal session after explicit approval. The action does not modify the source session or telemetry.
 
 “Observed — no known gaps” is not a completeness guarantee: Hermes observer hooks fail open. This plugin is explicitly enabled through Hermes' plugin trust gates; once enabled, collection starts prospectively by default. No performance target is claimed before benchmarking.
 
@@ -59,6 +59,8 @@ Run the storage and collector tests with:
 
 ```sh
 python3 -m unittest discover -s tests -v
+node --test tests/test_desktop_analyze.cjs
+node --check desktop/plugin.js
 ```
 
 The package layout follows Hermes' unified-plugin convention: `plugin.yaml` and `__init__.py` for the observer hooks, `dashboard/` for the profile-routed backend, and `desktop/plugin.js` for the local UI.

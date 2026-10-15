@@ -38,6 +38,14 @@ def _core() -> tuple[Any, Any, Any]:
     return store, service, runtime
 
 
+def _validate_profile(runtime: Any, expected_profile: str | None) -> str | None:
+    """Check a renderer's captured profile against the backend's routed profile."""
+    actual_profile = runtime.profile_name()
+    if expected_profile is not None and (not actual_profile or expected_profile != actual_profile):
+        raise HTTPException(status_code=409, detail="Connected profile changed; no cross-profile action was taken.")
+    return actual_profile
+
+
 def _unavailable(window: str = "Overall") -> dict[str, Any]:
     return {
         "available": False,
@@ -190,10 +198,33 @@ def reset_metrics() -> dict[str, float]:
         raise HTTPException(status_code=503, detail="The connected profile's session database is unavailable.")
 
 
+@router.post("/analyze-sessions/{session_id}/read-only")
+def lock_analyze_session(
+    session_id: str,
+    expected_profile: str = Query(..., alias="profile", min_length=1, max_length=128),
+) -> dict[str, Any]:
+    """Install a durable tool-blocking policy in the requested routed profile."""
+    _, _, runtime = _core()
+    actual_profile = _validate_profile(runtime, expected_profile)
+    policy = importlib.import_module(f"{_CORE_MODULE}.analyze_guard")
+    try:
+        policy.mark_read_only_session(session_id, runtime.profile_home())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid Analyze session identifier.") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Could not enforce the read-only Analyze session policy.") from exc
+    return {"read_only": True, "profile": actual_profile}
+
+
 @router.get("/sessions/{session_id}/calls/{call_id}/detail")
-def call_detail(session_id: str, call_id: str) -> dict[str, Any]:
-    """Read selected call detail from canonical source messages on demand."""
+def call_detail(
+    session_id: str,
+    call_id: str,
+    expected_profile: str | None = Query(None, alias="profile", max_length=128),
+) -> dict[str, Any]:
+    """Read selected call detail and bind it to the actual connected profile."""
     store, service, runtime = _core()
+    actual_profile = _validate_profile(runtime, expected_profile)
     try:
         with runtime.profile_connection() as conn:
             if conn is None:
@@ -201,6 +232,7 @@ def call_detail(session_id: str, call_id: str) -> dict[str, Any]:
             result = service.call_detail(conn, session_id, call_id)
             if result is None:
                 raise HTTPException(status_code=404, detail="Call or source session not found.")
+            result["profile"] = actual_profile
             return result
     except store.UnsupportedSchemaVersion:
         raise HTTPException(

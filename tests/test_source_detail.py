@@ -66,10 +66,25 @@ class SourceDetailTests(unittest.TestCase):
 
     def test_call_detail_uses_exact_source_id_and_returns_visible_context_only(self):
         self._insert_source_call()
+        before_call_count = self.conn.execute(
+            "SELECT COUNT(*) FROM hermes_observability_calls"
+        ).fetchone()[0]
+        before_source = self.conn.execute(
+            "SELECT id, role, content, tool_call_id, tool_calls FROM messages ORDER BY id"
+        ).fetchall()
 
         result = service.call_detail(self.conn, "captured", self.call_id)
 
+        after_call_count = self.conn.execute(
+            "SELECT COUNT(*) FROM hermes_observability_calls"
+        ).fetchone()[0]
+        after_source = self.conn.execute(
+            "SELECT id, role, content, tool_call_id, tool_calls FROM messages ORDER BY id"
+        ).fetchall()
+        self.assertEqual(before_call_count, after_call_count)
+        self.assertEqual(before_source, after_source)
         self.assertTrue(result["available"])
+        self.assertIn("Analyze this failed Hermes tool call", result["analyze_prompt"])
         self.assertEqual(result["source"]["status"], "matched")
         self.assertEqual(result["source"]["arguments"], {"path": "config.yaml"})
         self.assertEqual(result["source"]["result"], "contents: mode: 0600")
@@ -89,6 +104,9 @@ class SourceDetailTests(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertEqual(result["source"]["status"], "missing")
         self.assertIsNone(result["source"]["arguments"])
+        self.assertIn("Source correlation: missing", result["analyze_prompt"])
+        self.assertIn("Arguments: unavailable", result["analyze_prompt"])
+        self.assertIn("permission denied", result["analyze_prompt"])
         self.assertIsNone(result["source"]["result"])
         self.assertEqual(result["context"], [])
 
