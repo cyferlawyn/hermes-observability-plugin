@@ -42,6 +42,18 @@ const EMPTY_APPROVALS = {
   unsupported_sessions: 0,
   not_captured_sessions: 0
 }
+const EMPTY_SUBAGENTS = {
+  events: { total: 0, succeeded: 0, failed: 0, interrupted: 0, unknown: 0 },
+  unmatched_starts: 0,
+  unmatched_stops: 0,
+  identity_gaps: 0,
+  supported_sessions: 0,
+  observed_sessions: 0,
+  partial_sessions: 0,
+  unknown_sessions: 0,
+  unsupported_sessions: 0,
+  not_captured_sessions: 0
+}
 
 const rootStyle = {
   display: 'flex', flexDirection: 'column', gap: 12, padding: 16,
@@ -115,6 +127,23 @@ function approvalCoverageLabel(coverage) {
     partial: 'Partial', unknown: 'Unknown', not_captured: 'Not captured'
   })[state] || 'Unknown'
   return `${support} · ${stateText}`
+}
+
+function subagentCoverageLabel(coverage) {
+  if (!coverage) return 'Unknown subagent coverage'
+  const support = coverage.support_state || 'unknown'
+  const state = coverage.coverage_state || 'unknown'
+  const stateText = ({
+    observed_no_known_gaps: 'Observed — no known gaps',
+    partial: 'Partial', unknown: 'Unknown', not_captured: 'Not captured'
+  })[state] || 'Unknown'
+  return `${support} · ${stateText}`
+}
+
+function subagentStatusLabel(status, captureState) {
+  if (captureState === 'start_only') return 'Started · no observed stop'
+  if (captureState === 'stop_only') return 'Stopped · start unmatched'
+  return ({ succeeded: 'Succeeded', failed: 'Failed', interrupted: 'Interrupted', unknown: 'Unknown' })[status] || 'Unknown'
 }
 
 function matchBasisLabel(basis) {
@@ -217,16 +246,21 @@ function ControlRoom({ rest }) {
     }
     let live = true
     setTrace(null)
-    rest(`/sessions/${encodeURIComponent(selectedId)}/trace?window=${encodeURIComponent(timeWindow)}&timezone=${encodeURIComponent(timezone)}`)
+    // The overview window filters sessions; an explicitly selected related session may cross it.
+    rest(`/sessions/${encodeURIComponent(selectedId)}/trace?window=Overall&timezone=${encodeURIComponent(timezone)}`)
       .then(data => { if (live) setTrace(data) })
       .catch(err => { if (live) setError(err?.message || 'Could not read this session trace.') })
     return () => { live = false }
-  }, [rest, selectedId, refreshKey, timeWindow, timezone])
+  }, [rest, selectedId, refreshKey, timezone])
 
   const sessions = Array.isArray(overview?.sessions) ? overview.sessions : []
   const metrics = overview?.metrics || EMPTY_METRICS
   const providerMetrics = overview?.provider_attempts || EMPTY_PROVIDER_ATTEMPTS
   const approvalMetrics = overview?.approvals || EMPTY_APPROVALS
+  const subagentMetrics = overview?.subagents || EMPTY_SUBAGENTS
+  const subagentCounts = subagentMetrics.events || EMPTY_SUBAGENTS.events
+  const subagentCoverage = trace?.subagent_coverage
+  const subagentEvents = Array.isArray(trace?.subagents) ? trace.subagents : []
   const approvalCounts = approvalMetrics.events || EMPTY_APPROVALS.events
   const approvalCoverage = trace?.approval_coverage
   const approvalEvents = Array.isArray(trace?.approvals) ? trace.approvals : []
@@ -246,6 +280,7 @@ function ControlRoom({ rest }) {
       : 'Overall includes all still-available sessions.'
   const selected = sessions.find(session => session.id === selectedId)
     || (trace?.session?.id === selectedId ? trace.session : null)
+  const selectedNotInOverview = Boolean(selected && !sessions.some(session => session.id === selectedId))
   const events = Array.isArray(trace?.calls) ? trace.calls : []
   const findings = Array.isArray(overview?.repeated_failures) ? overview.repeated_failures : []
   const findingsCoverageIncomplete = Number(metrics.rate_excluded_sessions || 0) > 0
@@ -358,6 +393,39 @@ function ControlRoom({ rest }) {
         style: cardStyle,
         children: [
           jsxs('div', { children: [
+            jsx('h2', { style: { fontSize: 13, margin: '0 0 3px' }, children: 'Subagent lifecycle' }),
+            jsx('div', { style: mutedStyle, children: 'Delegated child starts and stops are tracked as their own event family. Child goals and available summaries are shown without copying child transcripts.' })
+          ] }),
+          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }, children: [
+            jsx(Metric, {
+              label: 'Child lifecycles observed',
+              value: subagentMetrics.supported_sessions > 0 ? `≥${subagentCounts.total}` : '—',
+              detail: `${subagentCounts.succeeded} succeeded · ${subagentCounts.failed} failed · ${subagentCounts.interrupted} interrupted · ${subagentCounts.unknown} unknown`
+            }),
+            jsx(Metric, {
+              label: 'Unmatched lifecycle events',
+              value: subagentMetrics.supported_sessions > 0
+                ? (subagentMetrics.unmatched_starts || 0) + (subagentMetrics.unmatched_stops || 0)
+                : '—',
+              detail: subagentMetrics.supported_sessions > 0
+                ? `${subagentMetrics.unmatched_starts || 0} starts without stops · ${subagentMetrics.unmatched_stops || 0} stops without starts · ${subagentMetrics.identity_gaps || 0} missing parent/child IDs`
+                : 'No compatible subagent-family support; unmatched counts cannot be inferred.'
+            }),
+            jsx(Metric, {
+              label: 'Subagent coverage',
+              value: `${subagentMetrics.observed_sessions || 0} observed`,
+              detail: `${subagentMetrics.supported_sessions || 0} supported · ${subagentMetrics.partial_sessions || 0} partial · ${subagentMetrics.unknown_sessions || 0} unknown · ${subagentMetrics.unsupported_sessions || 0} unsupported · ${subagentMetrics.not_captured_sessions || 0} not captured`
+            })
+          ] }),
+          jsx('div', { style: { ...mutedStyle, marginTop: 5 }, children: subagentMetrics.supported_sessions > 0
+            ? 'Only compatible subagent-family sessions contribute counts. Unmatched or interrupted lifecycles remain visible and coverage is not inferred from tool-call coverage.'
+            : 'No compatible subagent observer coverage is available in this window; missing events cannot be interpreted as zero.' })
+        ]
+      }),
+      jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsxs('div', { children: [
             jsx('h2', { style: { fontSize: 13, margin: '0 0 3px' }, children: 'Repeated failures' }),
             jsx('div', { style: mutedStyle, children: 'Exact tool identity; structured error code/type preferred, otherwise exact message with UUID/ISO-timestamp masking only. No fuzzy grouping or generated remediation.' })
           ] }),
@@ -423,7 +491,8 @@ function ControlRoom({ rest }) {
           jsxs('section', { style: { ...cardStyle, overflow: 'auto', minHeight: 0 }, children: [
             selected ? jsxs('div', { style: { marginBottom: 10 }, children: [
               jsx('h2', { style: { fontSize: 13, margin: '0 0 3px' }, children: selected.title || selected.id }),
-              jsx('div', { style: mutedStyle, children: `${displayTime(selected.started_at)} · ${coverageLabel(selected.coverage_state)}` })
+              jsx('div', { style: mutedStyle, children: `${displayTime(selected.started_at)} · ${coverageLabel(selected.coverage_state)}` }),
+              selectedNotInOverview ? jsx('div', { style: mutedStyle, children: 'Opened through a relationship; not shown in the filtered session list.' }) : null
             ] }) : jsx('div', { style: mutedStyle, children: 'Select a session to inspect its captured trace.' }),
             selected && events.length === 0 ? jsx('div', { style: mutedStyle, children: selected.coverage_state === 'observed_no_known_gaps' ? 'No observed tool calls in this session.' : 'No captured tool calls. This session may predate collection.' }) : null,
             ...events.map(event => jsxs('article', {
@@ -477,6 +546,56 @@ function ControlRoom({ rest }) {
               ]
             }, event.id))
           ] })
+        ]
+      }),
+      jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8 }, children: [
+            jsx('h2', { style: { fontSize: 13, margin: 0 }, children: 'Subagent relationships' }),
+            jsx('span', { style: mutedStyle, children: subagentCoverageLabel(subagentCoverage) })
+          ] }),
+          jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: subagentCoverage?.observer_schema_version
+            ? `Observer schema ${subagentCoverage.observer_schema_version} · ${subagentCoverage.event_count || 0} lifecycle events emitted by this session · ${subagentCoverage.unmatched_starts || 0} unmatched starts · ${subagentCoverage.unmatched_stops || 0} unmatched stops · ${subagentCoverage.identity_gaps || 0} missing-ID events. Child transcripts are not copied.`
+            : 'Subagent-family support or coverage is unknown for this session.' }),
+          subagentEvents.length === 0
+            ? jsx('div', { style: { ...mutedStyle, marginTop: 8 }, children: subagentCoverage?.coverage_state === 'observed_no_known_gaps'
+              ? 'No subagent lifecycle events observed in this session.'
+              : 'No subagent events captured; absence cannot be inferred from this coverage state.' })
+            : subagentEvents.map(event => {
+              const relatedSessionId = event.relationship === 'parent'
+                ? event.child_session_id : event.parent_session_id
+              const relation = event.relationship === 'parent' ? 'Child session' : 'Parent session'
+              const relatedSessionAvailable = event.relationship === 'parent'
+                ? event.child_session_available : event.parent_session_available
+              return jsxs('article', {
+                style: { borderTop: '1px solid var(--ui-stroke-secondary)', padding: '8px 0', marginTop: 7 },
+                children: [
+                  jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8 }, children: [
+                    jsx('strong', { children: `${event.relationship === 'parent' ? 'Child' : 'Parent'}${event.child_role ? ` · ${event.child_role}` : ''}` }),
+                    jsx('span', { style: mutedStyle, children: subagentStatusLabel(event.status, event.capture_state) })
+                  ] }),
+                  jsx('div', { style: { ...mutedStyle, marginTop: 2, overflowWrap: 'anywhere' }, children: `Parent ${event.parent_session_id || 'ID unavailable'} · Child ${event.child_session_id || 'ID unavailable'} · ${displayTime(event.started_at || event.stopped_at)}${event.duration_ms == null ? '' : ` · ${Number(event.duration_ms).toFixed(0)} ms`}` }),
+                  event.parent_turn_id || event.parent_subagent_id || event.child_subagent_id
+                    ? jsx('div', { style: { ...mutedStyle, marginTop: 3, overflowWrap: 'anywhere' }, children: [
+                      event.parent_turn_id ? `parent turn ${event.parent_turn_id}` : '',
+                      event.parent_subagent_id ? `parent agent ${event.parent_subagent_id}` : '',
+                      event.child_subagent_id ? `child agent ${event.child_subagent_id}` : ''
+                    ].filter(Boolean).join(' · ') }) : null,
+                  event.child_goal ? jsxs('div', { style: { marginTop: 5, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: [jsx('strong', { children: 'Goal: ' }), event.child_goal] }) : null,
+                  event.child_summary ? jsxs('div', { style: { marginTop: 5, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }, children: [jsx('strong', { children: 'Summary: ' }), event.child_summary] }) : null,
+                  event.capture_state !== 'paired'
+                    ? jsx('div', { style: { ...mutedStyle, marginTop: 4 }, children: 'Lifecycle unmatched; subagent-family coverage is partial.' }) : null,
+                  relatedSessionId && relatedSessionAvailable ? jsx('button', {
+                    type: 'button', style: { ...buttonStyle, marginTop: 6 },
+                    onClick: () => { setDetails({}); setSelectedId(relatedSessionId) },
+                    children: `Open related ${relation.toLowerCase()} ${relatedSessionId}`
+                  }) : jsx('div', { style: { ...mutedStyle, marginTop: 5 }, children: relatedSessionId
+                    ? `${relation} ${relatedSessionId} is not present in source storage; navigation is unavailable.`
+                    : `${relation} navigation unavailable because its session ID was not observed.` })
+                ]
+              }, event.id)
+            })
         ]
       }),
       jsxs('section', {

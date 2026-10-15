@@ -41,8 +41,10 @@ class Collector:
                 if conn is not None:
                     version = _observer_schema_version(kwargs)
                     store.register_session(conn, session_id, observer_schema_version=version)
+                    store.link_subagent_child_session(conn, session_id)
                     store.register_provider_family(conn, session_id, version)
                     store.register_approval_family(conn, session_id, version)
+                    store.register_subagent_family(conn, session_id, version)
         except Exception:
             log.warning("observability: failed to mark session start", exc_info=True)
 
@@ -56,8 +58,10 @@ class Collector:
                 if conn is not None:
                     version = _observer_schema_version(kwargs)
                     store.register_session(conn, session_id, observer_schema_version=version)
+                    store.link_subagent_child_session(conn, session_id)
                     store.register_provider_family(conn, session_id, version)
                     store.register_approval_family(conn, session_id, version)
+                    store.register_subagent_family(conn, session_id, version)
         except Exception:
             log.warning("observability: failed to close session run", exc_info=True)
 
@@ -369,9 +373,72 @@ class Collector:
         except Exception:
             log.warning("observability: failed to record approval response", exc_info=True)
 
+    def on_subagent_start(self, **kwargs: Any) -> None:
+        """Capture the documented child-start metadata, without child content."""
+        parent_id = _nonblank_identity(kwargs.get("parent_session_id"))
+        session_id = parent_id or _nonblank_identity(kwargs.get("session_id"))
+        if not session_id or not self._is_eligible(session_id):
+            return
+        version = _observer_schema_version(kwargs)
+        try:
+            with self._connection() as conn:
+                if conn is None or not store.register_session(
+                    conn, session_id, observer_schema_version=version
+                ):
+                    return
+                store.register_subagent_family(conn, session_id, version)
+                store.begin_subagent(
+                    conn, session_id,
+                    parent_session_id=parent_id,
+                    child_session_id=kwargs.get("child_session_id"),
+                    parent_turn_id=kwargs.get("parent_turn_id"),
+                    parent_subagent_id=kwargs.get("parent_subagent_id"),
+                    child_subagent_id=kwargs.get("child_subagent_id"),
+                    child_role=kwargs.get("child_role"),
+                    child_goal=kwargs.get("child_goal"),
+                    started_at=time.time(),
+                    observer_schema_version=version,
+                )
+        except Exception:
+            log.warning("observability: failed to record subagent start", exc_info=True)
+
+    def on_subagent_stop(self, **kwargs: Any) -> None:
+        """Capture a child stop, pairing only a unique supplied identity."""
+        parent_id = _nonblank_identity(kwargs.get("parent_session_id"))
+        session_id = parent_id or _nonblank_identity(kwargs.get("session_id"))
+        if not session_id or not self._is_eligible(session_id):
+            return
+        version = _observer_schema_version(kwargs)
+        event = {
+            **kwargs,
+            "stopped_at": time.time(),
+            "telemetry_schema_version": version,
+        }
+        try:
+            with self._connection() as conn:
+                if conn is None or not store.register_session(
+                    conn, session_id, observer_schema_version=version
+                ):
+                    return
+                store.register_subagent_family(conn, session_id, version)
+                if not store.complete_matching_subagent(conn, session_id, event):
+                    store.record_unmatched_subagent_stop(
+                        conn, session_id, event, parent_session_id=parent_id
+                    )
+        except Exception:
+            log.warning("observability: failed to record subagent stop", exc_info=True)
+
     def _is_eligible(self, session_id: str) -> bool:
         with self._lock:
             return session_id in self._eligible
+
+
+def _nonblank_identity(value: Any) -> str | None:
+    """Treat absent/blank IDs as unknown while preserving nonblank IDs verbatim."""
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = str(value)
+    return text if text.strip() else None
 
 
 def _tool_call_match_key(
@@ -462,6 +529,8 @@ def register(ctx: Any, connection_factory: Callable[[], Any]) -> Collector:
         ("api_request_error", collector.on_api_request_error),
         ("pre_approval_request", collector.on_pre_approval_request),
         ("post_approval_response", collector.on_post_approval_response),
+        ("subagent_start", collector.on_subagent_start),
+        ("subagent_stop", collector.on_subagent_stop),
     ):
         ctx.register_hook(name, callback)
     return collector

@@ -38,7 +38,7 @@ class StoreMigrationTests(unittest.TestCase):
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(hermes_observability_calls)")}
         self.assertIn("error_code", columns)
         self.assertIn("failure_status", columns)
-        self.assertEqual(conn.execute("SELECT value FROM hermes_observability_meta WHERE key = 'schema_version'").fetchone()[0], "4")
+        self.assertEqual(conn.execute("SELECT value FROM hermes_observability_meta WHERE key = 'schema_version'").fetchone()[0], "5")
         self.assertEqual(conn.execute("SELECT error_message FROM hermes_observability_calls WHERE id = 'call1'").fetchone()[0], "disk error")
         conn.close()
     def test_schema_v2_creates_provider_family_tables_without_changing_call_rows(self):
@@ -66,9 +66,36 @@ class StoreMigrationTests(unittest.TestCase):
         self.assertIn("hermes_observability_provider_attempts", tables)
         self.assertIn("hermes_observability_family_coverage", tables)
         self.assertIn("hermes_observability_approvals", tables)
+        self.assertIn("hermes_observability_subagents", tables)
         self.assertEqual(
             conn.execute("SELECT value FROM hermes_observability_meta WHERE key = 'schema_version'").fetchone()[0],
-            "4",
+            "5",
+        )
+        conn.close()
+
+    def test_schema_v4_adds_subagent_storage_without_touching_core_tables(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at REAL NOT NULL)")
+        conn.execute("INSERT INTO sessions VALUES ('s1', 100.0)")
+        store.initialize(conn)
+        conn.execute("DROP TABLE hermes_observability_subagents")
+        conn.execute("UPDATE hermes_observability_meta SET value = '4' WHERE key = 'schema_version'")
+        conn.commit()
+
+        store.initialize(conn)
+
+        self.assertEqual(
+            conn.execute("SELECT value FROM hermes_observability_meta WHERE key = 'schema_version'").fetchone()[0],
+            "5",
+        )
+        self.assertIn(
+            "hermes_observability_subagents",
+            {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")},
+        )
+        self.assertEqual(
+            [row["name"] for row in conn.execute("PRAGMA table_info(sessions)")],
+            ["id", "started_at"],
         )
         conn.close()
 

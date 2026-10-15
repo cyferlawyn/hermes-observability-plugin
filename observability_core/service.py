@@ -28,6 +28,9 @@ def overview(
         "approvals": store.approval_metrics(
             conn, window=window, now=now, timezone_name=timezone_name
         ),
+        "subagents": store.subagent_metrics(
+            conn, window=window, now=now, timezone_name=timezone_name
+        ),
         "sessions": store.list_sessions(
             conn, limit=session_limit, window=window, now=now, timezone_name=timezone_name
         ),
@@ -59,6 +62,8 @@ def session_trace(
         "provider_coverage": store.provider_session_coverage(conn, session_id),
         "approvals": store.session_approvals(conn, session_id),
         "approval_coverage": store.approval_session_coverage(conn, session_id),
+        "subagents": store.session_subagents(conn, session_id),
+        "subagent_coverage": store.subagent_session_coverage(conn, session_id),
     }
 
 
