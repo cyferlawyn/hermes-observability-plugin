@@ -295,11 +295,13 @@ test('Control Room presents tool breakdown and a unified, chronological session 
     }
   }
   const { ControlRoom } = vm.runInNewContext(source, hooks)
+  const renderedNodes = []
   const render = node => {
     if (node == null || typeof node === 'boolean') return ''
     if (Array.isArray(node)) return node.map(render).join(' ')
     if (typeof node !== 'object') return String(node)
     if (typeof node.type === 'function') return render(node.type(node.props || {}))
+    renderedNodes.push(node)
     return `${Object.entries(node.props || {}).filter(([key]) => key !== 'children').map(([, value]) => typeof value === 'string' ? value : '').join(' ')} ${render(node.props?.children)}`
   }
   const text = render(ControlRoom({ rest: async () => ({}) }))
@@ -313,8 +315,12 @@ test('Control Room presents tool breakdown and a unified, chronological session 
   assert.match(text, /Subagent/)
   const chronology = [
     'Find the incident cause', 'Provider attempt · copilot', 'Tool call · mcp__files__read',
-    'Approval ·', 'Subagent · researcher'
+    'Approval', 'Subagent · researcher'
   ].map(marker => text.indexOf(marker))
   assert.ok(chronology.every(index => index >= 0), 'each event family is present in the timeline')
   assert.deepEqual(chronology, [...chronology].sort((a, b) => a - b), 'mixed event families render in timestamp order')
+  const statusTones = [...new Set(renderedNodes.map(node => node.props?.['data-status-tone']).filter(Boolean))]
+  assert.ok(['info', 'success', 'danger', 'subagent'].every(tone => statusTones.includes(tone)), 'event status chips use distinct semantic colors')
+  assert.ok(renderedNodes.some(node => node.props?.['data-metric-tone'] === 'warning'), 'sub-90% success metric is highlighted as cautionary')
+  assert.ok(renderedNodes.some(node => node.type === 'section' && String(node.props?.style?.border || '').includes('--dt-border')), 'panels use the stronger prototype-style border')
 })
