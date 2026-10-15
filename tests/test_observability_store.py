@@ -86,6 +86,47 @@ class ObservabilityStoreTests(unittest.TestCase):
         self.assertEqual(metrics["excluded_sessions"], 0)
         self.assertEqual(metrics["rate_excluded_sessions"], 1)
 
+    def test_tool_breakdown_uses_exact_identity_and_tool_specific_coverage(self):
+        store.register_session(self.conn, "s2", captured_at=210.0)
+        self.conn.execute(
+            "INSERT INTO sessions (id, started_at, title) VALUES ('s3', 300.0, 'Partial exact tool')"
+        )
+        self.conn.execute(
+            "INSERT INTO sessions (id, started_at, title) VALUES ('s4', 400.0, 'Uncaptured')"
+        )
+        self.conn.commit()
+        store.register_session(self.conn, "s3", captured_at=310.0)
+
+        success_id = store.begin_tool_call(
+            self.conn, "s1", "mcp__files__read", started_at=120.0, tool_call_id="mcp-1"
+        )
+        assert success_id is not None
+        store.complete_tool_call(self.conn, success_id, "ok", completed_at=121.0)
+        # A gap in a different exact tool identity must not poison this tool's cohort.
+        store.begin_tool_call(
+            self.conn, "s2", "mcp__files__write", started_at=220.0, tool_call_id="write-1"
+        )
+        # An unmatched invocation of the selected exact tool makes this session partial for it.
+        store.begin_tool_call(
+            self.conn, "s3", "mcp__files__read", started_at=320.0, tool_call_id="mcp-2"
+        )
+
+        result = store.tool_breakdown(self.conn)
+        selected = next(row for row in result if row["tool_name"] == "mcp__files__read")
+
+        self.assertEqual(selected["calls"], {
+            "total": 2, "ok": 1, "failed": 0, "not_executed": 0, "unknown": 1
+        })
+        self.assertEqual(selected["rate_calls"], {"ok": 1, "failed": 0, "denominator": 1})
+        self.assertEqual(selected["success_rate"], 1.0)
+        self.assertEqual(selected["coverage"], {
+            "total_sessions": 4,
+            "observed_sessions": 2,
+            "partial_sessions": 1,
+            "unknown_sessions": 0,
+            "not_captured_sessions": 1,
+        })
+
     def test_source_session_deletion_cascades_telemetry(self):
         call_id = store.begin_tool_call(self.conn, "s1", "files.read", started_at=120.0)
         store.complete_tool_call(self.conn, call_id, "ok", completed_at=121.0)

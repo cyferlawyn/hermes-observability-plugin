@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 from . import analyze_prompt, source_detail, store
@@ -31,6 +32,9 @@ def overview(
         "subagents": store.subagent_metrics(
             conn, window=window, now=now, timezone_name=timezone_name
         ),
+        "tool_breakdown": store.tool_breakdown(
+            conn, window=window, now=now, timezone_name=timezone_name
+        ),
         "sessions": store.list_sessions(
             conn, limit=session_limit, window=window, now=now, timezone_name=timezone_name
         ),
@@ -54,17 +58,93 @@ def session_trace(
     )
     if session is None:
         return None
+    calls = store.session_trace(conn, session_id)
+    provider_attempts = store.session_provider_attempts(conn, session_id)
+    approvals = store.session_approvals(conn, session_id)
+    subagents = store.session_subagents(conn, session_id)
+    timeline = _chronological_timeline(
+        conn, session_id, captured=session.get("captured_at") is not None,
+        calls=calls, provider_attempts=provider_attempts, approvals=approvals,
+        subagents=subagents,
+    )
     return {
         "window": window,
         "session": session,
-        "calls": store.session_trace(conn, session_id),
-        "provider_attempts": store.session_provider_attempts(conn, session_id),
+        "calls": calls,
+        "provider_attempts": provider_attempts,
         "provider_coverage": store.provider_session_coverage(conn, session_id),
-        "approvals": store.session_approvals(conn, session_id),
+        "approvals": approvals,
         "approval_coverage": store.approval_session_coverage(conn, session_id),
-        "subagents": store.session_subagents(conn, session_id),
+        "subagents": subagents,
         "subagent_coverage": store.subagent_session_coverage(conn, session_id),
+        "timeline": timeline,
     }
+
+
+def _time_key(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _first_available(row: dict[str, Any], first: str, second: str) -> Any:
+    value = row.get(first)
+    return value if value is not None else row.get(second)
+
+
+def _chronological_timeline(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    captured: bool,
+    calls: list[dict[str, Any]],
+    provider_attempts: list[dict[str, Any]],
+    approvals: list[dict[str, Any]],
+    subagents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge visible source messages and observer events without persisting content."""
+    timeline: list[dict[str, Any]] = []
+    if captured:
+        for message in source_detail.visible_messages(conn, session_id):
+            timeline.append({
+                **message,
+                "id": f"message:{message['source_message_id']}",
+                "kind": "message",
+            })
+    families = (
+        ("tool_call", calls, lambda row: _first_available(row, "started_at", "completed_at")),
+        ("provider_attempt", provider_attempts,
+         lambda row: _first_available(row, "started_at", "ended_at")),
+        ("approval", approvals,
+         lambda row: _first_available(row, "requested_at", "decided_at")),
+        ("subagent", subagents,
+         lambda row: _first_available(row, "started_at", "stopped_at")),
+    )
+    for kind, events, timestamp_of in families:
+        for event in events:
+            item = {**event, "kind": kind, "timestamp": timestamp_of(event)}
+            timeline.append(item)
+
+    priority = {"message": 0, "provider_attempt": 1, "tool_call": 2, "approval": 3, "subagent": 4}
+    def order_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        timestamp = _time_key(item.get("timestamp"))
+        if timestamp is not None:
+            return (0, timestamp, priority.get(item["kind"], 9), str(item.get("id", "")))
+        # Un-timestamped events remain visible but are explicitly placed after
+        # known-time records; source IDs provide deterministic, not inferred,
+        # ordering among them.
+        return (1, priority.get(item["kind"], 9), str(item.get("id", "")))
+    return sorted(timeline, key=order_key)
 
 
 def call_detail(

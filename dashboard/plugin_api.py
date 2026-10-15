@@ -114,6 +114,7 @@ def _unavailable(window: str = "Overall") -> dict[str, Any]:
             "not_captured_sessions": 0,
         },
         "sessions": [],
+        "tool_breakdown": [],
         "repeated_failures": [],
     }
 
