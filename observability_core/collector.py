@@ -22,6 +22,9 @@ class Collector:
         self._ambiguous_pending_keys: set[tuple[str, ...]] = set()
         self._provider_pending: dict[tuple[str, ...], str] = {}
         self._ambiguous_provider_pending_keys: set[tuple[str, ...]] = set()
+        self._approval_pending: dict[tuple[str, ...], str] = {}
+        self._ambiguous_approval_keys: set[tuple[str, ...]] = set()
+        self._quarantined_approval_keys: set[tuple[str, ...]] = set()
         self._lock = threading.RLock()
 
     def _connection(self):
@@ -39,6 +42,7 @@ class Collector:
                     version = _observer_schema_version(kwargs)
                     store.register_session(conn, session_id, observer_schema_version=version)
                     store.register_provider_family(conn, session_id, version)
+                    store.register_approval_family(conn, session_id, version)
         except Exception:
             log.warning("observability: failed to mark session start", exc_info=True)
 
@@ -53,6 +57,7 @@ class Collector:
                     version = _observer_schema_version(kwargs)
                     store.register_session(conn, session_id, observer_schema_version=version)
                     store.register_provider_family(conn, session_id, version)
+                    store.register_approval_family(conn, session_id, version)
         except Exception:
             log.warning("observability: failed to close session run", exc_info=True)
 
@@ -73,6 +78,16 @@ class Collector:
             }
             self._ambiguous_provider_pending_keys = {
                 key for key in self._ambiguous_provider_pending_keys if key[0] != session_id
+            }
+            self._approval_pending = {
+                key: event_id for key, event_id in self._approval_pending.items()
+                if key[0] != session_id
+            }
+            self._ambiguous_approval_keys = {
+                key for key in self._ambiguous_approval_keys if key[0] != session_id
+            }
+            self._quarantined_approval_keys = {
+                key for key in self._quarantined_approval_keys if key[0] != session_id
             }
 
     def on_pre_tool_call(self, **kwargs: Any) -> None:
@@ -262,6 +277,98 @@ class Collector:
         except Exception:
             log.warning("observability: failed to record provider attempt completion", exc_info=True)
 
+    def on_pre_approval_request(self, **kwargs: Any) -> None:
+        """Capture approval request metadata only; never persist command text."""
+        session_id = _approval_session_id(kwargs, self._is_eligible)
+        if not session_id:
+            return
+        version = _observer_schema_version(kwargs)
+        key = _approval_match_key(session_id, kwargs)
+        try:
+            with self._lock:
+                with self._connection() as conn:
+                    if conn is None or not store.register_session(
+                        conn, session_id, observer_schema_version=version
+                    ):
+                        return
+                    store.register_approval_family(conn, session_id, version)
+                    key_seen = bool(key and store.approval_key_seen(conn, key))
+                    event_id = store.begin_approval_request(
+                        conn,
+                        session_id,
+                        session_key=kwargs.get("session_key"),
+                        turn_id=kwargs.get("turn_id"),
+                        tool_call_id=kwargs.get("tool_call_id"),
+                        surface=kwargs.get("surface"),
+                        pattern_key=kwargs.get("pattern_key"),
+                        pattern_keys=kwargs.get("pattern_keys"),
+                        requested_at=time.time(),
+                        observer_schema_version=version,
+                    )
+                if event_id and key:
+                    if key_seen:
+                        self._approval_pending.pop(key, None)
+                        self._ambiguous_approval_keys.add(key)
+                        self._quarantined_approval_keys.add(key)
+                        return
+                    if key in self._ambiguous_approval_keys or key in self._quarantined_approval_keys:
+                        return
+                    if key in self._approval_pending:
+                        self._approval_pending.pop(key, None)
+                        self._ambiguous_approval_keys.add(key)
+                    else:
+                        self._approval_pending[key] = event_id
+        except Exception:
+            log.warning("observability: failed to record approval request", exc_info=True)
+
+    def on_post_approval_response(self, **kwargs: Any) -> None:
+        """Capture an explicit decision, pairing only on unambiguous supplied IDs."""
+        session_id = _approval_session_id(kwargs, self._is_eligible)
+        if not session_id:
+            return
+        key = _approval_match_key(session_id, kwargs)
+        with self._lock:
+            if key and key not in self._ambiguous_approval_keys and key not in self._quarantined_approval_keys:
+                event_id = self._approval_pending.pop(key, None)
+                self._quarantined_approval_keys.add(key)
+            else:
+                event_id = None
+        version = _observer_schema_version(kwargs)
+        try:
+            with self._connection() as conn:
+                if conn is None or not store.register_session(
+                    conn, session_id, observer_schema_version=version
+                ):
+                    return
+                store.register_approval_family(conn, session_id, version)
+                completed = bool(
+                    event_id and store.complete_approval_request(
+                        conn,
+                        event_id,
+                        choice=kwargs.get("choice"),
+                        decided_by=kwargs.get("decided_by"),
+                        decided_at=time.time(),
+                        observer_schema_version=version,
+                    )
+                )
+                if not completed:
+                    store.record_post_only_approval(
+                        conn,
+                        session_id,
+                        session_key=kwargs.get("session_key"),
+                        turn_id=kwargs.get("turn_id"),
+                        tool_call_id=kwargs.get("tool_call_id"),
+                        surface=kwargs.get("surface"),
+                        pattern_key=kwargs.get("pattern_key"),
+                        pattern_keys=kwargs.get("pattern_keys"),
+                        choice=kwargs.get("choice"),
+                        decided_by=kwargs.get("decided_by"),
+                        decided_at=time.time(),
+                        observer_schema_version=version,
+                    )
+        except Exception:
+            log.warning("observability: failed to record approval response", exc_info=True)
+
     def _is_eligible(self, session_id: str) -> bool:
         with self._lock:
             return session_id in self._eligible
@@ -305,6 +412,27 @@ def _provider_attempt_match_key(kwargs: dict[str, Any]) -> tuple[str, ...] | Non
     )
 
 
+def _approval_session_id(kwargs: dict[str, Any], is_eligible: Callable[[str], bool]) -> str | None:
+    for key in ("session_id", "session_key"):
+        value = _optional_text(kwargs.get(key))
+        if value and is_eligible(value):
+            return value
+    return None
+
+
+def _approval_match_key(session_id: str, kwargs: dict[str, Any]) -> tuple[str, ...] | None:
+    turn_id = _optional_text(kwargs.get("turn_id"))
+    tool_call_id = _optional_text(kwargs.get("tool_call_id"))
+    if not any(value is not None and value.strip() for value in (turn_id, tool_call_id)):
+        return None
+    return (
+        session_id,
+        store.approval_surface(kwargs.get("surface")),
+        turn_id or "",
+        tool_call_id or "",
+    )
+
+
 def _observer_schema_version(kwargs: dict[str, Any]) -> str:
     value = kwargs.get("telemetry_schema_version")
     return str(value) if value not in (None, "") else "unknown"
@@ -332,6 +460,8 @@ def register(ctx: Any, connection_factory: Callable[[], Any]) -> Collector:
         ("pre_api_request", collector.on_pre_api_request),
         ("post_api_request", collector.on_post_api_request),
         ("api_request_error", collector.on_api_request_error),
+        ("pre_approval_request", collector.on_pre_approval_request),
+        ("post_approval_response", collector.on_post_approval_response),
     ):
         ctx.register_hook(name, callback)
     return collector
