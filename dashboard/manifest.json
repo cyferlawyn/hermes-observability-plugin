@@ -3,6 +3,6 @@
   "label": "Observability",
   "description": "Local operational traces and outcome metrics for this connected Hermes profile.",
   "icon": "Activity",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "api": "plugin_api.py"
 }

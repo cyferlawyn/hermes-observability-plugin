@@ -73,6 +73,41 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(old_example_trace["session"]["id"], "captured")
         self.assertEqual(old_example_trace["calls"][0]["tool_name"], "mcp__browser__search")
 
+    def test_overview_attaches_only_explicit_exact_tool_documentation_links(self):
+        self.conn.execute(
+            "UPDATE hermes_observability_calls SET tool_name = ? WHERE session_id = ?",
+            ("mcp__browser__search", "captured"),
+        )
+        second_id = store.begin_tool_call(
+            self.conn, "captured", "terminal", started_at=124.0, tool_call_id="terminal-1"
+        )
+        assert second_id is not None
+        store.complete_tool_call(self.conn, second_id, "ok", completed_at=125.0)
+        self.conn.execute(
+            "INSERT INTO sessions (id, started_at, title) VALUES ('captured-2', 200.0, 'Second')"
+        )
+        self.conn.commit()
+        store.register_session(self.conn, "captured-2", captured_at=210.0)
+        repeated_id = store.begin_tool_call(
+            self.conn, "captured-2", "mcp__browser__search", started_at=220.0, tool_call_id="browser-2"
+        )
+        assert repeated_id is not None
+        store.complete_tool_call(
+            self.conn, repeated_id, "error", completed_at=221.0,
+            error_type="TimeoutError", error_message="request timed out"
+        )
+
+        result = service.overview(self.conn, documentation_links={
+            "mcp__browser__search": "https://docs.example.invalid/search",
+            "mcp__browser": "https://docs.example.invalid/near-miss",
+        })
+
+        by_tool = {row["tool_name"]: row for row in result["tool_breakdown"]}
+        self.assertEqual(by_tool["mcp__browser__search"]["documentation_url"], "https://docs.example.invalid/search")
+        self.assertNotIn("documentation_url", by_tool["terminal"])
+        [finding] = result["repeated_failures"]
+        self.assertEqual(finding["documentation_url"], "https://docs.example.invalid/search")
+
     def test_overview_labels_uncaptured_sessions_and_reports_telemetry_counts(self):
         result = service.overview(self.conn)
 

@@ -168,6 +168,13 @@ function matchBasisLabel(basis) {
   })[basis] || 'Deterministic exact match'
 }
 
+function failureRetryEvidenceLabel(finding) {
+  if (finding.retry_state === 'observed') return `${finding.retry_count} linked provider retries observed`
+  if (finding.retry_state === 'partial') return `At least ${finding.retry_count} linked provider retries observed; some exact call-to-request links are missing.`
+  if (finding.retry_state === 'unknown') return 'A matching provider attempt exists, but its retry count is unknown.'
+  return 'No exact provider-attempt link; retry count was not captured for this finding.'
+}
+
 function formatDetailValue(value) {
   if (value === null || value === undefined) return 'Unavailable'
   if (typeof value === 'string') return value
@@ -362,6 +369,15 @@ function StatusBadge({ label, tone = 'neutral' }) {
   })
 }
 
+function DocumentationLink({ url }) {
+  if (typeof url !== 'string' || !/^https:\/\//i.test(url)) return null
+  return jsx('a', {
+    href: url, target: '_blank', rel: 'noopener noreferrer',
+    style: { color: 'var(--theme-primary)', fontSize: 10, whiteSpace: 'nowrap', textDecoration: 'none' },
+    children: 'Documentation ↗'
+  })
+}
+
 function AnalyzeAction({ event, detail, activeProfile, analyzingCallId, analyzeStatus, onAnalyze }) {
   if (event.outcome !== 'failed' || !detail?.analyze_prompt || detail.profile !== activeProfile) return null
   return jsxs('section', {
@@ -399,6 +415,8 @@ function ControlRoom({ rest }) {
   const [analyzeStatus, setAnalyzeStatus] = useState({ callId: '', message: '' })
   const [selectedEventId, setSelectedEventId] = useState('')
   const [sessionSearch, setSessionSearch] = useState('')
+  const [activeView, setActiveView] = useState('control')
+  const [ledgerSearch, setLedgerSearch] = useState('')
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 
   useEffect(() => {
@@ -410,6 +428,8 @@ function ControlRoom({ rest }) {
     setDetails({})
     setSelectedEventId('')
     setSessionSearch('')
+    setActiveView('control')
+    setLedgerSearch('')
     setDetailLoading('')
     setAnalyzingCallId('')
     setAnalyzeStatus({ callId: '', message: '' })
@@ -469,6 +489,7 @@ function ControlRoom({ rest }) {
     setTrace(null)
     setSelectedEventId(String(example.call_id))
     setSelectedId(example.session_id)
+    setActiveView('control')
     inspectCall({ id: example.call_id, session_id: example.session_id })
   }
 
@@ -566,11 +587,25 @@ function ControlRoom({ rest }) {
   const toolBreakdown = Array.isArray(overview?.tool_breakdown) ? overview.tool_breakdown : []
   const filteredSessions = sessions.filter(session => `${session.title || ''} ${session.id || ''}`
     .toLowerCase().includes(sessionSearch.trim().toLowerCase()))
+  const ledgerQuery = ledgerSearch.trim().toLowerCase()
+  const filteredTimeline = ledgerQuery ? timeline.filter(event => [
+    event.kind, event.tool_name, event.provider, event.model, event.role, event.outcome,
+    event.status, event.error_code, event.error_type, event.error_message, event.content,
+    event.child_role, event.child_goal
+  ].filter(value => value != null).join(' ').toLowerCase().includes(ledgerQuery)) : timeline
   const visibleDetails = Object.fromEntries(
     Object.entries(details).filter(([, detail]) => detail?.profile === connectedProfile)
   )
   const findings = Array.isArray(overview?.repeated_failures) ? overview.repeated_failures : []
   const findingsCoverageIncomplete = Number(metrics.rate_excluded_sessions || 0) > 0
+  const failureSessions = sessions
+    .filter(session => Number(session.call_counts?.failed || 0) > 0 || Number(session.call_counts?.unknown || 0) > 0)
+    .sort((left, right) => Number(right.call_counts?.failed || 0) - Number(left.call_counts?.failed || 0)
+      || Number(right.call_counts?.unknown || 0) - Number(left.call_counts?.unknown || 0)
+      || Number(right.started_at || 0) - Number(left.started_at || 0))
+  const viewOptions = [
+    ['control', 'Control room'], ['failures', 'Failure queue'], ['ledger', 'Trace ledger']
+  ]
 
   return jsxs('div', {
     style: rootStyle,
@@ -579,7 +614,7 @@ function ControlRoom({ rest }) {
         style: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 },
         children: [
           jsxs('div', { children: [
-            jsx('h1', { style: { fontSize: 18, margin: '0 0 3px' }, children: 'Control room' }),
+            jsx('h1', { style: { fontSize: 18, margin: '0 0 3px' }, children: activeView === 'control' ? 'Control room' : activeView === 'failures' ? 'Failure queue' : 'Trace ledger' }),
             jsx('div', { style: mutedStyle, children: 'Prospective operational traces for the connected profile.' })
           ] }),
           jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }, children: [
@@ -628,6 +663,19 @@ function ControlRoom({ rest }) {
         style: { ...mutedStyle, fontSize: 11 },
         children: `${timeWindow} · ${windowDescription} Coverage: ${metrics.included_sessions || 0} sessions included; ${metrics.observed_sessions || 0} observed, ${metrics.partial_sessions || 0} partial, ${metrics.unknown_sessions || 0} unknown, ${metrics.excluded_sessions || 0} not captured. Sessions are counted wholly by start time. Incomplete observations are lower-bound evidence; “no known gaps” is not a completeness guarantee.`
       }),
+      jsx('div', {
+        role: 'group', 'aria-label': 'Observability view',
+        style: { display: 'flex', flexWrap: 'wrap', gap: 5, alignSelf: 'flex-start', border: '1px solid var(--dt-border, #253143)', background: 'var(--dt-card-seed, #0e131c)', borderRadius: 8, padding: 3 },
+        children: viewOptions.map(([id, label]) => jsx('button', {
+          type: 'button', 'aria-pressed': activeView === id,
+          onClick: () => setActiveView(id),
+          style: { ...buttonStyle, padding: '5px 10px', borderColor: activeView === id ? 'var(--theme-primary, #83b8ff)' : 'transparent', background: activeView === id ? 'var(--theme-secondary, #1b3554)' : 'transparent', fontWeight: activeView === id ? 650 : 500 },
+          children: label
+        }, id))
+      }),
+      activeView === 'control' ? jsxs('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: 12 },
+        children: [
       jsxs('div', {
         style: { display: 'flex', flexWrap: 'wrap', alignItems: 'stretch', gap: 10 },
         children: [
@@ -663,7 +711,12 @@ function ControlRoom({ rest }) {
                         displayTime(session.started_at),
                         jsx(StatusBadge, { label: coverageLabel(session.coverage_state), tone: coverageTone(session.coverage_state) })
                       ] }),
-                      jsx('span', { style: mutedStyle, children: `${session.call_count || 0} observed calls` })
+                      jsx('span', { style: mutedStyle, children: `${session.call_count || 0} observed calls` }),
+                      jsxs('span', { style: { display: 'flex', flexWrap: 'wrap', gap: 5 }, children: [
+                        session.call_counts?.failed > 0 ? jsx(StatusBadge, { label: `${session.call_counts.failed} failed`, tone: 'danger' }) : null,
+                        session.call_counts?.unknown > 0 ? jsx(StatusBadge, { label: `${session.call_counts.unknown} unknown`, tone: 'warning' }) : null,
+                        session.call_success_rate != null ? jsx(StatusBadge, { label: `${(session.call_success_rate * 100).toFixed(0)}% known-call success`, tone: session.call_success_rate >= 0.9 ? 'success' : session.call_success_rate >= 0.75 ? 'warning' : 'danger' }) : null
+                      ] })
                     ] })
                   }, session.id))
                 ]
@@ -691,7 +744,10 @@ function ControlRoom({ rest }) {
                           style: { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) auto', gap: 7, alignItems: 'center', border: '1px solid var(--dt-border, #253143)', borderRadius: 7, padding: 8, background: 'var(--dt-card-seed, #0e131c)' },
                           children: [
                             jsxs('div', { style: { minWidth: 0 }, children: [
-                              jsx('div', { style: { overflowWrap: 'anywhere', fontWeight: 550 }, children: tool.tool_name }),
+                              jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 6 }, children: [
+                                jsx('div', { style: { overflowWrap: 'anywhere', fontWeight: 550 }, children: tool.tool_name }),
+                                jsx(DocumentationLink, { url: tool.documentation_url })
+                              ] }),
                               jsx('div', { style: { ...mutedStyle, fontSize: 11 }, children: `${toolCalls.total || 0} calls · ${toolCalls.failed || 0} failed · ${toolCalls.unknown || 0} unknown` }),
                               jsx('div', { style: { height: 6, background: 'var(--dt-muted, #1b2635)', border: '1px solid var(--dt-border, #253143)', borderRadius: 999, overflow: 'hidden', marginTop: 6 }, children: jsx('div', { style: { height: '100%', width: `${percent}%`, background: toolColors.color, boxShadow: `0 0 7px ${toolColors.color}` } }) }),
                               jsx('div', { style: { ...mutedStyle, fontSize: 10, marginTop: 4 }, children: `${toolRateCalls.denominator || 0} rate-eligible calls · ${coverage.observed_sessions || 0} observed / ${coverage.partial_sessions || 0} partial sessions` })
@@ -842,7 +898,8 @@ function ControlRoom({ rest }) {
                       jsx('strong', { children: `${finding.identity_kind === 'mcp' ? 'MCP' : 'Tool'} · ${finding.tool_name}` }),
                       jsx(StatusBadge, { label: 'Failed', tone: 'danger' })
                     ] }),
-                    jsx('div', { style: { ...mutedStyle, overflowWrap: 'anywhere', marginTop: 3 }, children: `${finding.at_least_n_observed ? 'At least ' : ''}${finding.distinct_failed_calls} failed calls · ${finding.affected_sessions} sessions · ${finding.error_excerpt || finding.signature}` })
+                    jsx('div', { style: { ...mutedStyle, overflowWrap: 'anywhere', marginTop: 3 }, children: `${finding.at_least_n_observed ? 'At least ' : ''}${finding.distinct_failed_calls} failed calls · ${finding.affected_sessions} sessions · ${finding.error_excerpt || finding.signature}` }),
+                    jsx(DocumentationLink, { url: finding.documentation_url })
                   ] }),
                   finding.examples?.[0] ? jsx('button', { type: 'button', style: buttonStyle, onClick: () => inspectFindingExample(finding.examples[0]), children: 'Inspect example' }) : null
                 ]
@@ -1211,7 +1268,149 @@ function ControlRoom({ rest }) {
       }),
           ] }),
         ]
-      })
+      }),
+          ] }) : null,
+      activeView === 'failures' ? jsxs('section', {
+        style: cardStyle,
+        children: [
+          jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: 8 }, children: [
+            jsx('h2', { style: { fontSize: 14, margin: 0 }, children: 'Cross-session failure queue' }),
+            jsx(StatusBadge, { label: findingsCoverageIncomplete ? 'Exclusions present' : `${findings.length} signatures`, tone: findingsCoverageIncomplete ? 'warning' : 'neutral' })
+          ] }),
+          jsx('div', { style: { ...mutedStyle, marginTop: 4 }, children: 'Deterministic evidence only. Incomplete populations are lower bounds; failure counts do not include provider retries.' }),
+          failureSessions.length ? jsxs('div', { style: { display: 'grid', gap: 5, marginTop: 10 }, children: [
+            jsx('h3', { style: { fontSize: 12, margin: 0 }, children: 'Sessions with failed or unknown outcomes' }),
+            ...failureSessions.map(session => jsx('button', {
+              type: 'button',
+              onClick: () => { setTrace(null); setDetails({}); setSelectedEventId(''); setSelectedId(session.id); setActiveView('control') },
+              style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', color: 'var(--ui-text-primary)', background: 'var(--dt-card-seed)', border: '1px solid var(--dt-border)', borderRadius: 7, padding: 8, cursor: 'pointer', font: 'inherit' },
+              children: [
+                jsxs('span', { style: { display: 'flex', flexDirection: 'column', gap: 3 }, children: [
+                  jsx('strong', { children: session.title || session.id }),
+                  jsx('span', { style: mutedStyle, children: `${session.call_count} observed calls · ${coverageLabel(session.coverage_state)}` })
+                ] }),
+                jsxs('span', { style: { display: 'flex', flexWrap: 'wrap', gap: 5 }, children: [
+                  session.call_counts.failed > 0 ? jsx(StatusBadge, { label: `${session.call_counts.failed} failed`, tone: 'danger' }) : null,
+                  session.call_counts.unknown > 0 ? jsx(StatusBadge, { label: `${session.call_counts.unknown} unknown`, tone: 'warning' }) : null,
+                  session.call_success_rate != null ? jsx(StatusBadge, { label: `${(session.call_success_rate * 100).toFixed(0)}%`, tone: session.call_success_rate >= 0.9 ? 'success' : session.call_success_rate >= 0.75 ? 'warning' : 'danger' }) : null
+                ] })
+              ]
+            }, session.id))
+          ] }) : null,
+          findings.length === 0
+            ? jsx('div', { style: { ...mutedStyle, padding: 12 }, children: 'No cross-session deterministic failure signatures in this window.' })
+            : jsxs('div', { style: { display: 'grid', gap: 8, marginTop: 10 }, children:
+              findings.map(finding => jsxs('article', {
+                style: { border: '1px solid var(--observability-danger-border, #71363d)', borderRadius: 8, padding: 10, background: 'var(--observability-danger-soft, #402126)' },
+                children: [
+                  jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: 8 }, children: [
+                    jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 7 }, children: [
+                      jsx('strong', { children: `${finding.identity_kind === 'mcp' ? 'MCP' : 'Tool'} · ${finding.tool_name}` }),
+                      jsx(StatusBadge, { label: 'Failed', tone: 'danger' }),
+                      finding.at_least_n_observed ? jsx(StatusBadge, { label: 'At least N observed', tone: 'warning' }) : null
+                    ] }),
+                    jsx('span', { style: mutedStyle, children: `${finding.distinct_failed_calls} calls · ${finding.affected_sessions} sessions` })
+                  ] }),
+                  jsx('div', { style: { marginTop: 7, fontWeight: 650, overflowWrap: 'anywhere' }, children: finding.error_excerpt || finding.signature }),
+                  jsx('div', { style: { ...mutedStyle, marginTop: 4, overflowWrap: 'anywhere' }, children: `Signature: ${finding.signature}` }),
+                  jsx(DocumentationLink, { url: finding.documentation_url }),
+                  jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: `Match basis: ${matchBasisLabel(finding.match_basis)} · first ${displayTime(finding.first_observed_at)} · last ${displayTime(finding.last_observed_at)} · ${finding.timeout_count || 0} observed timeouts` }),
+                  jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: failureRetryEvidenceLabel(finding) }),
+                  ...((Array.isArray(finding.examples) ? finding.examples : []).map((example, index) => jsx('button', {
+                    type: 'button', style: { ...buttonStyle, margin: '7px 6px 0 0' },
+                    onClick: () => inspectFindingExample(example),
+                    children: `Inspect example ${index + 1} · ${example.session_id}`
+                  }, `${finding.tool_name}-${finding.signature}-${example.session_id}-${example.call_id}`)))
+                ]
+              }, `${finding.tool_name}-${finding.signature}-${finding.match_basis}`))
+            })
+        ]
+      }) : null,
+      activeView === 'ledger' ? jsxs('div', {
+        style: { display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 10 },
+        children: [
+          jsxs('section', {
+            style: { ...cardStyle, flex: '2 1 600px', minWidth: 0, overflow: 'auto', maxHeight: 'min(78vh, 900px)' },
+            children: [
+              jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8, marginBottom: 8 }, children: [
+                jsxs('div', { children: [
+                  jsx('h2', { style: { fontSize: 14, margin: '0 0 3px' }, children: 'Trace ledger' }),
+                  jsx('div', { style: mutedStyle, children: selected ? `${selected.title || selected.id} · ${coverageLabel(selected.coverage_state)}` : 'Select a session in Control room to load its trace.' })
+                ] }),
+                jsx('span', { style: mutedStyle, children: `${filteredTimeline.length} / ${timeline.length} events` })
+              ] }),
+              jsx('input', {
+                type: 'search', value: ledgerSearch, placeholder: 'Filter events by name, status, or visible text…', 'aria-label': 'Filter events',
+                onChange: event => setLedgerSearch(event.target.value),
+                style: { width: '100%', boxSizing: 'border-box', color: 'var(--ui-text-primary)', background: 'var(--dt-input, transparent)', border: '1px solid var(--dt-border, #253143)', borderRadius: 6, padding: '7px 9px', font: 'inherit', marginBottom: 8 }
+              }),
+              timeline.length === 0
+                ? jsx('div', { style: { ...mutedStyle, padding: 12 }, children: !selected ? 'Choose a session in Control room to inspect its trace.' : selected.coverage_state === 'observed_no_known_gaps' ? 'No operational events observed in this session.' : 'No captured events; absence cannot be inferred from this coverage state.' })
+                : filteredTimeline.length === 0
+                  ? jsx('div', { style: { ...mutedStyle, padding: 12 }, children: 'No events match this filter.' })
+                  : null,
+              ...filteredTimeline.map(event => {
+                const tone = eventStatusTone(event)
+                const colors = statusColors(tone)
+                const title = event.kind === 'message'
+                  ? (event.role === 'user' ? 'User turn' : 'Assistant turn')
+                  : event.kind === 'provider_attempt'
+                    ? `Provider · ${event.provider || 'unknown'} · ${event.model || 'model unknown'}`
+                    : event.kind === 'tool_call'
+                      ? `Tool · ${event.tool_name || 'unknown tool'}`
+                      : event.kind === 'approval'
+                        ? 'Approval'
+                        : event.kind === 'subagent'
+                          ? `Subagent · ${event.child_role || 'role unknown'}`
+                          : timelineEventLabel(event)
+                const description = event.kind === 'message'
+                  ? event.content || (event.has_tool_calls ? 'Visible turn initiated tool calls.' : 'Visible turn with no text.')
+                  : event.kind === 'tool_call'
+                    ? event.error_message || event.error_code || event.error_type || outcomeLabel(event.outcome)
+                    : event.kind === 'provider_attempt'
+                      ? providerOutcomeLabel(event.outcome)
+                      : event.kind === 'approval'
+                        ? approvalOutcomeLabel(event.outcome, event.capture_state)
+                        : event.kind === 'subagent'
+                          ? subagentStatusLabel(event.status, event.capture_state)
+                          : timelineEventOutcome(event)
+                return jsx('button', {
+                  type: 'button', 'aria-pressed': Boolean(selectedTimelineEvent && String(selectedTimelineEvent.id) === String(event.id)),
+                  'data-status-tone': tone,
+                  onClick: () => { setSelectedEventId(String(event.id)); if (event.kind === 'tool_call') inspectCall(event) },
+                  style: { display: 'grid', gridTemplateColumns: '132px 4px minmax(0,1fr) auto', gap: 9, alignItems: 'center', width: '100%', textAlign: 'left', padding: '7px 8px', marginTop: 3, border: `1px solid ${selectedTimelineEvent && String(selectedTimelineEvent.id) === String(event.id) ? 'var(--theme-primary, #83b8ff)' : colors.border}`, borderRadius: 6, background: selectedTimelineEvent && String(selectedTimelineEvent.id) === String(event.id) ? 'var(--theme-secondary, #1b3554)' : 'var(--dt-card-seed, #0e131c)', color: 'var(--ui-text-primary)', cursor: 'pointer', font: 'inherit' },
+                  children: [
+                    jsx('span', { style: { ...mutedStyle, fontSize: 10, fontVariantNumeric: 'tabular-nums' }, children: displayTime(timelineEventTime(event)) }),
+                    jsx('span', { 'aria-hidden': true, style: { width: 4, minHeight: 22, borderRadius: 4, background: colors.color } }),
+                    jsxs('span', { style: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }, children: [
+                      jsx('strong', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: title }),
+                      jsx('span', { style: { ...mutedStyle, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: description })
+                    ] }),
+                    jsx(StatusBadge, { label: eventStatusLabel(event), tone })
+                  ]
+                }, `ledger-${event.kind}-${event.id}`)
+              })
+            ]
+          }),
+          selectedTimelineEvent ? jsxs('aside', {
+            style: { ...cardStyle, flex: '1 1 270px', minWidth: 0, position: 'sticky', top: 0 },
+            children: [
+              jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }, children: [
+                jsx('h2', { style: { fontSize: 13, margin: 0 }, children: 'Selected event' }),
+                jsx('span', { style: { ...mutedStyle, fontSize: 10 }, children: displayTime(timelineEventTime(selectedTimelineEvent)) })
+              ] }),
+              jsxs('div', { style: { border: `1px solid ${statusColors(eventStatusTone(selectedTimelineEvent)).border}`, borderLeft: `4px solid ${eventAccent(selectedTimelineEvent)}`, borderRadius: 7, padding: 8, marginTop: 8, background: 'var(--dt-card-seed, #0e131c)' }, children: [
+                jsx('strong', { children: timelineEventLabel(selectedTimelineEvent) }),
+                jsx('div', { style: { marginTop: 5 }, children: jsx(StatusBadge, { label: timelineEventOutcome(selectedTimelineEvent), tone: eventStatusTone(selectedTimelineEvent) }) })
+              ] }),
+              jsx('div', { style: { ...mutedStyle, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginTop: 8 }, children: selectedTimelineEvent.kind === 'message'
+                ? selectedTimelineEvent.content || 'No visible message text.'
+                : selectedTimelineEvent.error_message || selectedTimelineEvent.error_code || selectedTimelineEvent.error_type || selectedTimelineEvent.child_summary || selectedTimelineEvent.child_goal || timelineEventOutcome(selectedTimelineEvent) }),
+              jsx('button', { type: 'button', style: { ...buttonStyle, marginTop: 9 }, onClick: () => setActiveView('control'), children: 'Open full inspector' })
+            ]
+          }) : null
+        ]
+      }) : null
     ]
   })
 }

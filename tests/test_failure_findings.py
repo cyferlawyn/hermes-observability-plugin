@@ -67,6 +67,83 @@ class RepeatedFailureFindingTests(unittest.TestCase):
         self.assertEqual(finding["retry_count"], None)
         self.assertEqual(finding["retry_state"], "not_captured")
 
+    def test_provider_retries_attach_only_by_exact_api_and_turn_identity(self):
+        self.add_session("s1")
+        self.add_session("s2")
+        self.add_failure(
+            "s1", call_id="a", error_type="ToolError", error_message="required argument missing",
+            turn_id="turn-1", api_request_id="request-1",
+        )
+        self.add_failure(
+            "s2", call_id="b", error_type="ToolError", error_message="required argument missing",
+            turn_id="turn-2", api_request_id="request-2",
+        )
+        for session_id, turn_id, request_id, retries in (
+            ("s1", "turn-1", "request-1", 1), ("s2", "turn-2", "request-2", 2)
+        ):
+            attempt_id = store.begin_provider_attempt(
+                self.conn, session_id, turn_id=turn_id, api_request_id=request_id,
+                provider="synthetic", model="synthetic", started_at=110.0,
+            )
+            assert attempt_id is not None
+            store.complete_provider_attempt(
+                self.conn, attempt_id,
+                {"ended_at": 111.0, "retry_count": retries, "retryable": True}, outcome="ok"
+            )
+
+        future_attempt = store.begin_provider_attempt(
+            self.conn, "s1", turn_id="turn-1", api_request_id="request-1",
+            provider="synthetic", model="synthetic", started_at=119.0,
+            observer_schema_version="future.observer.v99",
+        )
+        assert future_attempt is not None
+        store.complete_provider_attempt(
+            self.conn, future_attempt,
+            {"ended_at": 120.0, "retry_count": 99, "retryable": True}, outcome="ok"
+        )
+
+        [finding] = self.findings()
+
+        self.assertEqual(finding["distinct_failed_calls"], 2)
+        self.assertEqual(finding["retry_count"], 3)
+        self.assertEqual(finding["retry_state"], "observed")
+
+    def test_ambiguous_provider_request_matches_are_not_counted_as_retries(self):
+        self.add_session("s1")
+        self.add_session("s2")
+        self.add_failure(
+            "s1", call_id="a", error_type="ToolError", error_message="required argument missing",
+            turn_id="turn-1", api_request_id="request-1",
+        )
+        self.add_failure(
+            "s2", call_id="b", error_type="ToolError", error_message="required argument missing",
+            turn_id="turn-2", api_request_id="request-2",
+        )
+        for retries in (2, 3):
+            attempt_id = store.begin_provider_attempt(
+                self.conn, "s1", turn_id="turn-1", api_request_id="request-1",
+                provider="synthetic", model="synthetic", started_at=110.0 + retries,
+            )
+            assert attempt_id is not None
+            store.complete_provider_attempt(
+                self.conn, attempt_id,
+                {"ended_at": 111.0 + retries, "retry_count": retries}, outcome="ok"
+            )
+        attempt_id = store.begin_provider_attempt(
+            self.conn, "s2", turn_id="turn-2", api_request_id="request-2",
+            provider="synthetic", model="synthetic", started_at=120.0,
+        )
+        assert attempt_id is not None
+        store.complete_provider_attempt(
+            self.conn, attempt_id, {"ended_at": 121.0, "retry_count": 1}, outcome="ok"
+        )
+
+        [finding] = self.findings()
+
+        self.assertEqual(finding["retry_count"], 1)
+        self.assertEqual(finding["retry_state"], "partial")
+        self.assertEqual(finding["distinct_failed_calls"], 2)
+
     def test_structured_error_code_precedes_error_type_and_message(self):
         self.add_session("s1")
         self.add_session("s2")

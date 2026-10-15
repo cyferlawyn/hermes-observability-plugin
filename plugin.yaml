@@ -1,6 +1,15 @@
 name: hermes-observability-plugin
-version: 0.1.0
+version: 1.0.0
 description: Prospective, profile-local operational trace for Hermes Desktop.
+config_schema:
+  documentation_links:
+    type: dict
+    default: {}
+    label: Tool/MCP documentation links
+    description: >-
+      Optional JSON mapping exact observer tool names to HTTPS documentation URLs.
+      MCP keys must use the complete mcp__server__tool identity. Links are shown only
+      for exact matches; the plugin never guesses documentation URLs.
 provides_hooks:
   - on_session_start
   - on_session_end

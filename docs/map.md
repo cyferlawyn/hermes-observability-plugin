@@ -6,7 +6,7 @@ An implementation-ready Ideal State Artifact for a personal-use observability da
 
 ## Notes
 
-- This map plans the ISA; it does not implement instrumentation or the dashboard. The consolidated draft is [ISA.md](ISA.md); detailed decision rationale is in the linked GitHub issues.
+- This is the historical decision map for the ISA; it planned the specification and did not implement the collector/dashboard. The project implementation and current release evidence are documented in [README.md](../README.md) and [release evidence](release/1.0.0-evidence.md).
 - Treat the active personal Hermes installation as the initial context unless a decision expands it. Favor local-first handling of session data.
 - Load `wayfinder` and `hermes-agent` when continuing. Use current Hermes docs/source for capability claims; the documented Web Dashboard plugin system and native Desktop plugin SDK are distinct extension surfaces.
 - Interpret “thinking exchange” carefully: decide what visible model/agent exchange and lifecycle data is useful. Do not assume hidden chain-of-thought is available or suitable for logging.
@@ -32,6 +32,6 @@ An implementation-ready Ideal State Artifact for a personal-use observability da
 
 ## Out of scope
 
-- Implementing the instrumentation or dashboard; this map ends at an approved ISA.
+- Implementing instrumentation or the dashboard was out of scope for this decision map; it is now covered by the versioned project implementation.
 - Unattended/automatic diagnosis or edits to tools, MCP servers, skills, or documentation. A user-triggered Analyze action may start a separate evidence-seeded session; remediation still requires separate explicit approval.
 - Sending session telemetry to a hosted third-party analytics service as a default. Revisit only if the destination is explicitly broadened.

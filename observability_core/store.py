@@ -1562,6 +1562,23 @@ def list_sessions(
         f"ON o.session_id = s.id WHERE {predicate} ORDER BY s.started_at DESC LIMIT ?",
         (*params, limit),
     ).fetchall()
+    call_counts_by_session: dict[str, dict[str, int]] = {
+        str(row["id"]): {"total": 0, "ok": 0, "failed": 0, "not_executed": 0, "unknown": 0}
+        for row in rows
+    }
+    if call_counts_by_session:
+        placeholders = ",".join("?" for _ in call_counts_by_session)
+        for call_row in conn.execute(
+            f"SELECT session_id, outcome, COUNT(*) AS n FROM {_CALLS_TABLE} "
+            f"WHERE session_id IN ({placeholders}) GROUP BY session_id, outcome",
+            tuple(call_counts_by_session),
+        ):
+            counts = call_counts_by_session[str(call_row["session_id"])]
+            outcome = str(call_row["outcome"])
+            if outcome in counts:
+                counts[outcome] = int(call_row["n"])
+                counts["total"] += int(call_row["n"])
+
     result = []
     for row in rows:
         item = dict(row)
@@ -1570,9 +1587,14 @@ def list_sessions(
             "not_captured" if item["captured_at"] is None
             else _coverage_state(conn, item["id"], version)
         )
-        item["call_count"] = conn.execute(
-            f"SELECT COUNT(*) FROM {_CALLS_TABLE} WHERE session_id = ?", (item["id"],)
-        ).fetchone()[0]
+        call_counts = call_counts_by_session[str(item["id"])]
+        item["call_counts"] = call_counts
+        item["call_count"] = call_counts["total"]
+        denominator = call_counts["ok"] + call_counts["failed"]
+        item["call_success_rate"] = (
+            call_counts["ok"] / denominator
+            if item["coverage_state"] == "observed_no_known_gaps" and denominator else None
+        )
         result.append(item)
     return result
 
@@ -1712,6 +1734,14 @@ def repeated_failure_findings(
         "ORDER BY COALESCE(c.completed_at, c.started_at), c.id",
         params,
     ).fetchall()
+    provider_rows = conn.execute(
+        f"SELECT p.session_id, p.turn_id, p.api_request_id, p.retry_count, p.capture_state "
+        f"FROM {_PROVIDER_ATTEMPTS_TABLE} p JOIN sessions s ON s.id = p.session_id "
+        f"WHERE {predicate} AND p.observer_schema_version = ? ORDER BY p.started_at, p.id",
+        (*params, OBSERVER_SCHEMA_VERSION),
+    ).fetchall()
     return repeated_failures.build_findings(
-        rows, population_excluded_sessions=population["rate_excluded_sessions"]
+        rows,
+        population_excluded_sessions=population["rate_excluded_sessions"],
+        provider_attempts=provider_rows,
     )

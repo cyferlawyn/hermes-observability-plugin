@@ -119,6 +119,16 @@ def _unavailable(window: str = "Overall") -> dict[str, Any]:
     }
 
 
+def _configured_documentation_links(service: Any) -> dict[str, str]:
+    """Read this plugin's profile-scoped links, returning none when config is unavailable."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config() or {}
+    except Exception:
+        return {}
+    return service.configured_documentation_links(config)
+
+
 def _validate_timezone(timezone: str | None) -> None:
     if not timezone:
         return
@@ -142,7 +152,8 @@ def overview(
             if conn is None:
                 return _unavailable(window)
             return service.overview(
-                conn, session_limit=limit, window=window, timezone_name=timezone
+                conn, session_limit=limit, window=window, timezone_name=timezone,
+                documentation_links=_configured_documentation_links(service),
             )
     except store.UnsupportedSchemaVersion:
         raise HTTPException(
