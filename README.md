@@ -4,7 +4,7 @@ A native Hermes Desktop observability plugin. The consolidated specification is 
 
 ## Control room
 
-![Hermes Desktop Observability Control room showing captured tool calls, success rate, and coverage.](docs/assets/observability-control-room.png)
+![Hermes Desktop Observability Control room with colorful status indicators, session activity, tool/MCP breakdown, and event inspector.](docs/assets/observability-control-room.png)
 
 ## MVP scope
 
