@@ -61,13 +61,24 @@ const rootStyle = {
   fontSize: 12, lineHeight: 1.45
 }
 const cardStyle = {
-  border: '1px solid var(--ui-stroke-secondary)', borderRadius: 8, padding: 12,
-  minWidth: 0
+  border: '1px solid var(--dt-border, #253143)', borderRadius: 10, padding: 12,
+  minWidth: 0, background: 'var(--dt-elevated-seed, #111722)'
+}
+const STATUS_PALETTE = {
+  success: { color: 'var(--ui-success, #78d9ae)', background: 'var(--observability-success-soft, #15382e)', border: 'var(--observability-success-border, #32604f)' },
+  danger: { color: 'var(--ui-danger, #ff8d91)', background: 'var(--observability-danger-soft, #402126)', border: 'var(--observability-danger-border, #71363d)' },
+  warning: { color: 'var(--ui-warning, #f0c778)', background: 'var(--observability-warning-soft, #3d321d)', border: 'var(--observability-warning-border, #6a5429)' },
+  info: { color: 'var(--theme-primary, #83b8ff)', background: 'var(--theme-accent-soft, #1b3554)', border: 'var(--theme-primary, #31577f)' },
+  subagent: { color: 'var(--observability-subagent, #c4a6ff)', background: 'var(--observability-subagent-soft, #302747)', border: 'var(--observability-subagent-border, #554477)' },
+  neutral: { color: 'var(--ui-text-secondary)', background: 'var(--dt-muted, #1b2635)', border: 'var(--dt-border, #253143)' }
+}
+function statusColors(tone) {
+  return STATUS_PALETTE[tone] || STATUS_PALETTE.neutral
 }
 const mutedStyle = { color: 'var(--ui-text-tertiary)' }
 const buttonStyle = {
   color: 'var(--ui-text-primary)', background: 'transparent',
-  border: '1px solid var(--ui-stroke-secondary)', borderRadius: 5,
+  border: '1px solid var(--dt-border, #253143)', borderRadius: 6,
   padding: '5px 9px', cursor: 'pointer', font: 'inherit'
 }
 
@@ -199,15 +210,38 @@ function timelineEventTimeValue(event) {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+function eventStatusTone(event) {
+  if (event.kind === 'message') return 'info'
+  if (event.capture_state && event.capture_state !== 'paired') return 'warning'
+  if (event.kind === 'subagent') {
+    if (event.status === 'succeeded') return 'subagent'
+    if (event.status === 'failed') return 'danger'
+    return 'warning'
+  }
+  const outcome = event.outcome
+  if (['failed', 'denied'].includes(outcome)) return 'danger'
+  if (['ok', 'allowed'].includes(outcome)) return 'success'
+  if (['unknown', 'not_executed', 'timed_out', 'cancelled'].includes(outcome)) return 'warning'
+  return 'neutral'
+}
+
+function eventStatusLabel(event) {
+  if (event.kind === 'message') return timelineEventOutcome(event)
+  if (event.kind === 'provider_attempt') return providerOutcomeLabel(event.outcome)
+  if (event.kind === 'tool_call') return outcomeLabel(event.outcome)
+  if (event.kind === 'approval') return approvalOutcomeLabel(event.outcome, event.capture_state)
+  if (event.kind === 'subagent') return subagentStatusLabel(event.status, event.capture_state)
+  return 'Observer event'
+}
+
+function coverageTone(state) {
+  if (state === 'observed_no_known_gaps') return 'success'
+  if (state === 'partial' || state === 'unknown') return 'warning'
+  return 'neutral'
+}
+
 function eventAccent(event) {
-  if (event.kind === 'message') return 'var(--theme-primary)'
-  const outcome = event.kind === 'approval' ? event.outcome
-    : event.kind === 'subagent' ? event.status : event.outcome
-  if (['failed', 'denied'].includes(outcome)) return 'var(--ui-danger, #f85149)'
-  if (['unknown', 'interrupted', 'not_executed'].includes(outcome)
-      || event.capture_state && !['paired'].includes(event.capture_state)) return 'var(--ui-warning, #d29922)'
-  if (['ok', 'allowed', 'succeeded'].includes(outcome)) return 'var(--ui-success, #00b5ab)'
-  return 'var(--ui-stroke-secondary)'
+  return statusColors(eventStatusTone(event)).color
 }
 
 function subscribeProfileChanges() {
@@ -296,13 +330,34 @@ async function startAnalyzeFollowUp(prompt, rest, sourceProfile) {
   }
 }
 
-function Metric({ label, value, detail }) {
+function Metric({ label, value, detail, tone = 'neutral' }) {
+  const colors = statusColors(tone)
   return jsxs('div', {
-    style: { ...cardStyle, flex: '1 1 130px' },
+    'data-metric-tone': tone,
+    style: { ...cardStyle, flex: '1 1 130px', borderTop: `3px solid ${colors.color}` },
     children: [
-      jsx('div', { style: mutedStyle, children: label }),
-      jsx('div', { style: { fontSize: 20, fontWeight: 650, marginTop: 3 }, children: value }),
+      jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6 }, children: [
+        jsx('span', { 'aria-hidden': true, style: { width: 6, height: 6, flex: '0 0 6px', borderRadius: '50%', background: colors.color, boxShadow: `0 0 7px ${colors.color}` } }),
+        jsx('div', { style: mutedStyle, children: label })
+      ] }),
+      jsx('div', { style: { fontSize: 20, fontWeight: 700, marginTop: 3, color: colors.color, fontVariantNumeric: 'tabular-nums' }, children: value }),
       jsx('div', { style: { ...mutedStyle, marginTop: 2 }, children: detail })
+    ]
+  })
+}
+
+function StatusBadge({ label, tone = 'neutral' }) {
+  const colors = statusColors(tone)
+  return jsx('span', {
+    'data-status-tone': tone,
+    style: {
+      display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap',
+      color: colors.color, background: colors.background, border: `1px solid ${colors.border}`,
+      borderRadius: 999, padding: '2px 7px', fontSize: 10, fontWeight: 650, lineHeight: 1.35
+    },
+    children: [
+      jsx('span', { 'aria-hidden': true, style: { width: 5, height: 5, flex: '0 0 5px', borderRadius: '50%', background: colors.color, boxShadow: `0 0 5px ${colors.color}` } }),
+      label
     ]
   })
 }
@@ -486,6 +541,8 @@ function ControlRoom({ rest }) {
   const rateCalls = metrics.rate_calls || EMPTY_METRICS.rate_calls
   const rate = metrics.success_rate === null || metrics.success_rate === undefined
     ? '—' : `${(metrics.success_rate * 100).toFixed(1)}%`
+  const rateTone = metrics.success_rate === null || metrics.success_rate === undefined
+    ? 'neutral' : metrics.success_rate >= 0.9 ? 'success' : metrics.success_rate >= 0.75 ? 'warning' : 'danger'
   const windowDescription = timeWindow === 'Today'
     ? 'Today uses the connected profile’s local calendar day.'
     : timeWindow === 'Since Reset'
@@ -560,11 +617,11 @@ function ControlRoom({ rest }) {
       jsxs('div', {
         style: { display: 'flex', flexWrap: 'wrap', gap: 8 },
         children: [
-          jsx(Metric, { label: 'Call success', value: rate, detail: `${calls.ok} ok / ${rateCalls.denominator} known executed` }),
-          jsx(Metric, { label: 'Invocations', value: calls.total, detail: 'Tool + MCP calls observed' }),
-          jsx(Metric, { label: 'Explicit failures', value: calls.failed, detail: 'Observer-reported failed outcomes' }),
-          jsx(Metric, { label: 'Unknown / not executed', value: `${calls.unknown} / ${calls.not_executed}`, detail: 'Visible; excluded from success-rate denominator' }),
-          jsx(Metric, { label: 'Retryable API failures', value: providerMetrics.retryable_failures || 0, detail: 'Observer-classified; not confirmed retries' })
+          jsx(Metric, { label: 'Call success', value: rate, detail: `${calls.ok} ok / ${rateCalls.denominator} known executed`, tone: rateTone }),
+          jsx(Metric, { label: 'Invocations', value: calls.total, detail: 'Tool + MCP calls observed', tone: 'info' }),
+          jsx(Metric, { label: 'Explicit failures', value: calls.failed, detail: 'Observer-reported failed outcomes', tone: calls.failed > 0 ? 'danger' : 'success' }),
+          jsx(Metric, { label: 'Unknown / not executed', value: `${calls.unknown} / ${calls.not_executed}`, detail: 'Visible; excluded from success-rate denominator', tone: calls.unknown + calls.not_executed > 0 ? 'warning' : 'neutral' }),
+          jsx(Metric, { label: 'Retryable API failures', value: providerMetrics.retryable_failures || 0, detail: 'Observer-classified; not confirmed retries', tone: providerMetrics.retryable_failures > 0 ? 'info' : 'neutral' })
         ]
       }),
       jsx('div', {
@@ -596,13 +653,16 @@ function ControlRoom({ rest }) {
                     onClick: () => { setTrace(null); setDetails({}); setSelectedEventId(''); setSelectedId(session.id) },
                     style: {
                       display: 'block', width: '100%', textAlign: 'left', padding: '8px 7px', marginBottom: 4,
-                      border: `1px solid ${selectedId === session.id ? 'var(--theme-primary)' : 'var(--ui-stroke-secondary)'}`,
-                      borderRadius: 6, background: selectedId === session.id ? 'var(--chrome-action-hover)' : 'transparent',
+                      border: `1px solid ${selectedId === session.id ? 'var(--theme-primary, #83b8ff)' : 'var(--dt-border, #253143)'}`,
+                      borderRadius: 7, background: selectedId === session.id ? 'var(--theme-secondary, #1b3554)' : 'var(--dt-card-seed, #0e131c)',
                       color: 'var(--ui-text-primary)', cursor: 'pointer', font: 'inherit'
                     },
-                    children: jsxs('span', { style: { display: 'flex', flexDirection: 'column', gap: 2 }, children: [
-                      jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: selectedId === session.id ? 600 : 500 }, children: session.title || session.id }),
-                      jsx('span', { style: mutedStyle, children: `${displayTime(session.started_at)} · ${coverageLabel(session.coverage_state)}` }),
+                    children: jsxs('span', { style: { display: 'flex', flexDirection: 'column', gap: 4 }, children: [
+                      jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: selectedId === session.id ? 650 : 550 }, children: session.title || session.id }),
+                      jsxs('span', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, ...mutedStyle }, children: [
+                        displayTime(session.started_at),
+                        jsx(StatusBadge, { label: coverageLabel(session.coverage_state), tone: coverageTone(session.coverage_state) })
+                      ] }),
                       jsx('span', { style: mutedStyle, children: `${session.call_count || 0} observed calls` })
                     ] })
                   }, session.id))
@@ -624,17 +684,19 @@ function ControlRoom({ rest }) {
                         const toolRateCalls = tool.rate_calls || {}
                         const toolRate = tool.success_rate == null ? null : Number(tool.success_rate)
                         const percent = toolRate == null ? 0 : Math.max(0, Math.min(100, toolRate * 100))
+                        const toolTone = toolCalls.failed > 0 ? 'danger' : toolCalls.unknown > 0 ? 'warning' : toolRate === null ? 'neutral' : 'success'
+                        const toolColors = statusColors(toolTone)
                         const coverage = tool.coverage || {}
                         return jsxs('div', {
-                          style: { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) auto', gap: 7, alignItems: 'center', borderTop: '1px solid var(--ui-stroke-tertiary)', paddingTop: 7 },
+                          style: { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) auto', gap: 7, alignItems: 'center', border: '1px solid var(--dt-border, #253143)', borderRadius: 7, padding: 8, background: 'var(--dt-card-seed, #0e131c)' },
                           children: [
                             jsxs('div', { style: { minWidth: 0 }, children: [
                               jsx('div', { style: { overflowWrap: 'anywhere', fontWeight: 550 }, children: tool.tool_name }),
                               jsx('div', { style: { ...mutedStyle, fontSize: 11 }, children: `${toolCalls.total || 0} calls · ${toolCalls.failed || 0} failed · ${toolCalls.unknown || 0} unknown` }),
-                              jsx('div', { style: { height: 4, background: 'var(--ui-stroke-tertiary)', borderRadius: 4, overflow: 'hidden', marginTop: 5 }, children: jsx('div', { style: { height: '100%', width: `${percent}%`, background: (toolCalls.failed || toolCalls.unknown) ? 'var(--ui-warning, #d29922)' : 'var(--ui-success, #00b5ab)' } }) }),
-                              jsx('div', { style: { ...mutedStyle, fontSize: 10, marginTop: 3 }, children: `${toolRateCalls.denominator || 0} rate-eligible calls · ${coverage.observed_sessions || 0} observed / ${coverage.partial_sessions || 0} partial sessions` })
+                              jsx('div', { style: { height: 6, background: 'var(--dt-muted, #1b2635)', border: '1px solid var(--dt-border, #253143)', borderRadius: 999, overflow: 'hidden', marginTop: 6 }, children: jsx('div', { style: { height: '100%', width: `${percent}%`, background: toolColors.color, boxShadow: `0 0 7px ${toolColors.color}` } }) }),
+                              jsx('div', { style: { ...mutedStyle, fontSize: 10, marginTop: 4 }, children: `${toolRateCalls.denominator || 0} rate-eligible calls · ${coverage.observed_sessions || 0} observed / ${coverage.partial_sessions || 0} partial sessions` })
                             ] }),
-                            jsx('strong', { style: { color: toolRate === null ? 'var(--ui-text-tertiary)' : toolRate >= 0.9 ? 'var(--ui-success, #00b5ab)' : 'var(--ui-warning, #d29922)', fontVariantNumeric: 'tabular-nums' }, children: toolRate === null ? '—' : `${(toolRate * 100).toFixed(0)}%` })
+                            jsx(StatusBadge, { label: toolRate === null ? '—' : `${(toolRate * 100).toFixed(0)}%`, tone: toolTone })
                           ]
                         }, tool.tool_name)
                       })
@@ -657,6 +719,8 @@ function ControlRoom({ rest }) {
               selected && timeline.length === 0 ? jsx('div', { style: { ...mutedStyle, padding: 10 }, children: selected.coverage_state === 'observed_no_known_gaps' ? 'No operational events observed in this session.' : 'No captured activity. This session may predate collection.' }) : null,
               ...timeline.map(event => {
                 const isSelected = selectedTimelineEvent && String(selectedTimelineEvent.id) === String(event.id)
+                const tone = eventStatusTone(event)
+                const colors = statusColors(tone)
                 const eventTitle = event.kind === 'message'
                   ? (event.role === 'user' ? 'User turn' : event.has_tool_calls ? 'Assistant turn · tool calls' : 'Assistant turn')
                   : event.kind === 'provider_attempt'
@@ -664,7 +728,7 @@ function ControlRoom({ rest }) {
                     : event.kind === 'tool_call'
                       ? `Tool call · ${event.tool_name || 'unknown tool'}`
                       : event.kind === 'approval'
-                        ? `Approval · ${approvalOutcomeLabel(event.outcome, event.capture_state)}`
+                        ? 'Approval'
                         : event.kind === 'subagent'
                           ? `Subagent${event.child_role ? ` · ${event.child_role}` : ''}`
                           : timelineEventLabel(event)
@@ -681,16 +745,16 @@ function ControlRoom({ rest }) {
                           ? `${timelineEventOutcome(event)}${event.duration_ms == null ? '' : ` · ${Number(event.duration_ms).toFixed(0)} ms`}`
                           : timelineEventOutcome(event)
                 return jsx('button', {
-                  type: 'button', 'aria-pressed': Boolean(isSelected),
+                  type: 'button', 'aria-pressed': Boolean(isSelected), 'data-status-tone': tone,
                   onClick: () => { setSelectedEventId(String(event.id)); if (event.kind === 'tool_call') inspectCall(event) },
-                  style: { display: 'grid', gridTemplateColumns: '76px 3px minmax(0,1fr)', gap: 9, width: '100%', textAlign: 'left', padding: '8px 7px', marginTop: 4, border: `1px solid ${isSelected ? 'var(--theme-primary)' : 'var(--ui-stroke-tertiary)'}`, borderRadius: 6, background: isSelected ? 'var(--chrome-action-hover)' : 'transparent', color: 'var(--ui-text-primary)', cursor: 'pointer', font: 'inherit' },
+                  style: { display: 'grid', gridTemplateColumns: '76px 4px minmax(0,1fr)', gap: 9, width: '100%', textAlign: 'left', padding: '9px 8px', marginTop: 5, border: `1px solid ${isSelected ? 'var(--theme-primary, #83b8ff)' : colors.border}`, borderRadius: 8, background: isSelected ? 'var(--theme-secondary, #1b3554)' : 'var(--dt-card-seed, #0e131c)', color: 'var(--ui-text-primary)', cursor: 'pointer', font: 'inherit' },
                   children: [
                     jsx('span', { style: { ...mutedStyle, fontSize: 10, paddingTop: 2, fontVariantNumeric: 'tabular-nums' }, children: displayTime(eventTime) }),
-                    jsx('span', { 'aria-hidden': true, style: { width: 3, borderRadius: 3, background: eventAccent(event), minHeight: 25 } }),
-                    jsxs('span', { style: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }, children: [
-                      jsxs('span', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'baseline' }, children: [
-                        jsx('strong', { children: eventTitle }),
-                        jsx('span', { style: { ...mutedStyle, fontSize: 10 }, children: event.kind === 'message' ? timelineEventOutcome(event) : event.kind === 'tool_call' ? outcomeLabel(event.outcome) : event.kind === 'provider_attempt' ? providerOutcomeLabel(event.outcome) : event.kind === 'approval' ? timelineEventOutcome(event) : event.kind === 'subagent' ? subagentStatusLabel(event.status, event.capture_state) : '' })
+                    jsx('span', { 'aria-hidden': true, style: { width: 4, borderRadius: 4, background: eventAccent(event), boxShadow: `0 0 7px ${eventAccent(event)}`, minHeight: 25 } }),
+                    jsxs('span', { style: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }, children: [
+                      jsxs('span', { style: { display: 'flex', flexWrap: 'wrap', gap: 7, alignItems: 'center' }, children: [
+                        jsx('strong', { style: { fontWeight: 650 }, children: eventTitle }),
+                        jsx(StatusBadge, { label: eventStatusLabel(event), tone })
                       ] }),
                       jsx('span', { style: { color: event.kind === 'message' ? 'var(--ui-text-secondary)' : 'var(--ui-text-tertiary)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: event.kind === 'message' ? 62 : 'none', overflow: event.kind === 'message' ? 'hidden' : 'visible' }, children: description })
                     ] })
@@ -708,9 +772,9 @@ function ControlRoom({ rest }) {
                 jsx('span', { style: { ...mutedStyle, fontSize: 10 }, children: selectedTimelineEvent ? displayTime(timelineEventTime(selectedTimelineEvent)) : '' })
               ] }),
               !selectedTimelineEvent ? jsx('div', { style: mutedStyle, children: 'Choose an event in the trace to inspect its evidence.' }) : jsxs('div', { children: [
-                jsxs('div', { style: { borderLeft: `3px solid ${eventAccent(selectedTimelineEvent)}`, paddingLeft: 9, marginBottom: 10 }, children: [
+                jsxs('div', { style: { border: `1px solid ${statusColors(eventStatusTone(selectedTimelineEvent)).border}`, borderLeft: `4px solid ${eventAccent(selectedTimelineEvent)}`, borderRadius: 7, padding: 8, marginBottom: 10, background: 'var(--dt-card-seed, #0e131c)' }, children: [
                   jsx('strong', { children: timelineEventLabel(selectedTimelineEvent) }),
-                  jsx('div', { style: { ...mutedStyle, marginTop: 3 }, children: timelineEventOutcome(selectedTimelineEvent) })
+                  jsx('div', { style: { marginTop: 5 }, children: jsx(StatusBadge, { label: timelineEventOutcome(selectedTimelineEvent), tone: eventStatusTone(selectedTimelineEvent) }) })
                 ] }),
                 selectedTimelineEvent.kind === 'message'
                   ? jsx('div', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', padding: 8, borderRadius: 5, background: 'var(--ui-bg-elevated, transparent)', maxHeight: 280, overflow: 'auto' }, children: selectedTimelineEvent.content || (selectedTimelineEvent.has_tool_calls ? 'Visible assistant turn initiated tool calls; tool calls are shown as separate events.' : 'No visible message text.') })
@@ -765,17 +829,20 @@ function ControlRoom({ rest }) {
         children: [
           jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'baseline' }, children: [
             jsx('h2', { style: { fontSize: 13, margin: 0 }, children: 'Repeated failure signatures' }),
-            jsx('span', { style: mutedStyle, children: findingsCoverageIncomplete ? 'Observed groups · exclusions present' : `${findings.length} groups` })
+            jsx(StatusBadge, { label: findingsCoverageIncomplete ? 'Exclusions present' : `${findings.length} groups`, tone: findingsCoverageIncomplete ? 'warning' : 'neutral' })
           ] }),
           findings.length === 0
             ? jsx('div', { style: { ...mutedStyle, marginTop: 7 }, children: 'No qualifying cross-session failure signature in this window.' })
             : jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 5, marginTop: 7 }, children: [
               ...findings.slice(0, 3).map(finding => jsxs('div', {
-                style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: 8, borderTop: '1px solid var(--ui-stroke-tertiary)', paddingTop: 7 },
+                style: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: 8, border: '1px solid var(--observability-danger-border, #71363d)', borderRadius: 8, padding: 8, background: 'var(--observability-danger-soft, #402126)' },
                 children: [
                   jsxs('div', { style: { minWidth: 0 }, children: [
-                    jsx('strong', { children: `${finding.identity_kind === 'mcp' ? 'MCP' : 'Tool'} · ${finding.tool_name}` }),
-                    jsx('div', { style: { ...mutedStyle, overflowWrap: 'anywhere' }, children: `${finding.at_least_n_observed ? 'At least ' : ''}${finding.distinct_failed_calls} failed calls · ${finding.affected_sessions} sessions · ${finding.error_excerpt || finding.signature}` })
+                    jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 7 }, children: [
+                      jsx('strong', { children: `${finding.identity_kind === 'mcp' ? 'MCP' : 'Tool'} · ${finding.tool_name}` }),
+                      jsx(StatusBadge, { label: 'Failed', tone: 'danger' })
+                    ] }),
+                    jsx('div', { style: { ...mutedStyle, overflowWrap: 'anywhere', marginTop: 3 }, children: `${finding.at_least_n_observed ? 'At least ' : ''}${finding.distinct_failed_calls} failed calls · ${finding.affected_sessions} sessions · ${finding.error_excerpt || finding.signature}` })
                   ] }),
                   finding.examples?.[0] ? jsx('button', { type: 'button', style: buttonStyle, onClick: () => inspectFindingExample(finding.examples[0]), children: 'Inspect example' }) : null
                 ]
